@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: easm-postgres
+    environment:
+      POSTGRES_DB: easm
+      POSTGRES_USER: easm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-easm_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U easm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - easm-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: easm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - easm-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: easm-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - easm-network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: easm-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_USER: ${MINIO_USER:-minioadmin}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-secret-key-in-production}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+    networks:
+      - easm-network
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: easm-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_USER: ${MINIO_USER:-minioadmin}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+    volumes:
+      - ./app:/app/app
+      - ./nuclei-templates:/root/nuclei-templates
+    networks:
+      - easm-network
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: easm-beat
+    command: celery -A app.celery_app beat --loglevel=info
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_USER: ${MINIO_USER:-minioadmin}
+      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+    volumes:
+      - ./app:/app/app
+    networks:
+      - easm-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+
+networks:
+  easm-network:
+    driver: bridge
