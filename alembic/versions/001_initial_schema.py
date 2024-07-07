@@ -40,7 +40,7 @@ def upgrade() -> None:
         sa.Column('last_seen', sa.DateTime(), nullable=True),
         sa.Column('risk_score', sa.Float(), nullable=True),
         sa.Column('is_active', sa.Boolean(), nullable=True),
-        sa.Column('metadata', sa.Text(), nullable=True),
+        sa.Column('raw_metadata', sa.Text(), nullable=True),
         sa.ForeignKeyConstraint(['tenant_id'], ['tenants.id'], ),
         sa.PrimaryKeyConstraint('id')
     )

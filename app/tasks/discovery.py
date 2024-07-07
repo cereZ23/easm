@@ -422,7 +422,7 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
             if existing:
                 # Update last seen
                 existing.last_seen = datetime.utcnow()
-                existing.metadata = json.dumps(record)
+                existing.raw_metadata = json.dumps(record)
                 updated_assets.append(host)
             else:
                 # Create new asset
@@ -430,7 +430,7 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
                     tenant_id=tenant_id,
                     type=asset_type,
                     identifier=host,
-                    metadata=json.dumps(record)
+                    raw_metadata=json.dumps(record)
                 )
                 db.add(asset)
                 db.flush()  # Get the ID

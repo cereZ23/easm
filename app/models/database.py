@@ -43,7 +43,7 @@ class Asset(Base):
     last_seen = Column(DateTime, default=datetime.utcnow)
     risk_score = Column(Float, default=0.0)
     is_active = Column(Boolean, default=True)
-    metadata = Column(Text)  # JSON field for flexible attrs
+    raw_metadata = Column(Text)  # JSON field for flexible attrs
 
     tenant = relationship("Tenant", back_populates="assets")
     services = relationship("Service", back_populates="asset", cascade="all, delete-orphan")
