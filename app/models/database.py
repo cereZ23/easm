@@ -54,6 +54,7 @@ class Asset(Base):
         Index('idx_tenant_type', 'tenant_id', 'type'),
         Index('idx_identifier', 'identifier'),
         Index('idx_tenant_identifier', 'tenant_id', 'identifier'),
+        Index('idx_unique_asset', 'tenant_id', 'identifier', 'type', unique=True),  # For bulk upsert
     )
 
     def __repr__(self):

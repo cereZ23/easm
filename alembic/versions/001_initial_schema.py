@@ -47,6 +47,8 @@ def upgrade() -> None:
     op.create_index('idx_identifier', 'assets', ['identifier'], unique=False)
     op.create_index('idx_tenant_identifier', 'assets', ['tenant_id', 'identifier'], unique=False)
     op.create_index('idx_tenant_type', 'assets', ['tenant_id', 'type'], unique=False)
+    # Unique constraint for bulk upsert ON CONFLICT
+    op.create_index('idx_unique_asset', 'assets', ['tenant_id', 'identifier', 'type'], unique=True)
 
     # Create seeds table
     op.create_table('seeds',
@@ -127,6 +129,7 @@ def downgrade() -> None:
     op.drop_table('events')
     op.drop_index('idx_tenant_enabled', table_name='seeds')
     op.drop_table('seeds')
+    op.drop_index('idx_unique_asset', table_name='assets')
     op.drop_index('idx_tenant_type', table_name='assets')
     op.drop_index('idx_tenant_identifier', table_name='assets')
     op.drop_index('idx_identifier', table_name='assets')
