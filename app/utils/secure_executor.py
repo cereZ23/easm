@@ -17,6 +17,8 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 import logging
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,24 +33,6 @@ class SecureToolExecutor:
     Prevents command injection and enforces resource limits
     """
 
-    # Whitelist of allowed tools
-    ALLOWED_TOOLS = {
-        'subfinder',
-        'dnsx',
-        'httpx',
-        'naabu',
-        'katana',
-        'nuclei',
-        'tlsx',
-        'uncover',
-        'notify'
-    }
-
-    # Default resource limits
-    DEFAULT_TIMEOUT = 600  # 10 minutes
-    DEFAULT_CPU_LIMIT = 300  # 5 minutes of CPU time
-    DEFAULT_MEMORY_LIMIT = 1024 * 1024 * 1024  # 1GB
-
     def __init__(self, tenant_id: int):
         """
         Initialize executor for specific tenant
@@ -57,19 +41,30 @@ class SecureToolExecutor:
             tenant_id: Tenant ID for isolation and resource tracking
         """
         self.tenant_id = tenant_id
-        self.temp_dir = None
+        self.temp_dir: Optional[Path] = None
+        self.allowed_tools = settings.tool_allowed_tools
+        self.timeout = settings.tool_execution_timeout
+        self.max_output_size = settings.tool_execution_max_output_size
 
     def __enter__(self):
         """Create isolated temporary directory for tenant"""
-        self.temp_dir = tempfile.mkdtemp(prefix=f'tenant_{self.tenant_id}_')
+        if settings.tool_temp_dir:
+            settings.tool_temp_dir.mkdir(parents=True, exist_ok=True)
+            self.temp_dir = Path(tempfile.mkdtemp(
+                prefix=f'tenant_{self.tenant_id}_',
+                dir=settings.tool_temp_dir
+            ))
+        else:
+            self.temp_dir = Path(tempfile.mkdtemp(prefix=f'tenant_{self.tenant_id}_'))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Cleanup temporary directory"""
-        if self.temp_dir and os.path.exists(self.temp_dir):
+        if self.temp_dir and self.temp_dir.exists():
             try:
                 import shutil
                 shutil.rmtree(self.temp_dir)
+                logger.debug(f"Cleaned up temp dir: {self.temp_dir}")
             except Exception as e:
                 logger.error(f"Failed to cleanup temp dir {self.temp_dir}: {e}")
 
@@ -86,8 +81,8 @@ class SecureToolExecutor:
         Raises:
             ToolExecutionError: If tool not in whitelist
         """
-        if tool not in self.ALLOWED_TOOLS:
-            raise ToolExecutionError(f"Tool '{tool}' is not allowed. Allowed tools: {self.ALLOWED_TOOLS}")
+        if tool not in self.allowed_tools:
+            raise ToolExecutionError(f"Tool '{tool}' is not allowed. Allowed tools: {self.allowed_tools}")
         return tool
 
     def sanitize_args(self, args: List[str]) -> List[str]:
@@ -105,15 +100,25 @@ class SecureToolExecutor:
             # Convert to string and strip dangerous characters
             safe_arg = str(arg).strip()
 
+            # Block command injection attempts
+            dangerous_chars = [';', '&', '|', '$', '`', '\n', '\r']
+            if any(char in safe_arg for char in dangerous_chars):
+                logger.warning(f"Rejecting argument with dangerous characters: {safe_arg}")
+                continue
+
             # Validate file paths
             if safe_arg.startswith('/') or safe_arg.startswith('./'):
                 # Ensure path is within temp directory
-                if self.temp_dir and not Path(safe_arg).resolve().is_relative_to(Path(self.temp_dir)):
-                    logger.warning(f"Rejecting path outside temp dir: {safe_arg}")
+                try:
+                    arg_path = Path(safe_arg).resolve()
+                    if self.temp_dir and not arg_path.is_relative_to(self.temp_dir):
+                        logger.warning(f"Rejecting path outside temp dir: {safe_arg}")
+                        continue
+                except (ValueError, OSError) as e:
+                    logger.warning(f"Invalid path: {safe_arg} - {e}")
                     continue
 
-            # Quote argument for shell safety
-            sanitized.append(shlex.quote(safe_arg))
+            sanitized.append(safe_arg)
 
         return sanitized
 
@@ -165,11 +170,11 @@ class SecureToolExecutor:
         # Restricted environment
         env = {
             'PATH': '/usr/local/bin:/usr/bin:/bin',
-            'HOME': self.temp_dir or '/tmp',
+            'HOME': str(self.temp_dir) if self.temp_dir else '/tmp',
             'LANG': 'C.UTF-8',
         }
 
-        timeout = timeout or self.DEFAULT_TIMEOUT
+        timeout = timeout or self.timeout
 
         logger.info(f"Executing tool for tenant {self.tenant_id}: {tool} (timeout: {timeout}s)")
 
@@ -186,8 +191,9 @@ class SecureToolExecutor:
                 text=True,
                 timeout=timeout,
                 env=env,
-                cwd=self.temp_dir or '/tmp',
-                preexec_fn=preexec_fn
+                cwd=str(self.temp_dir) if self.temp_dir else '/tmp',
+                preexec_fn=preexec_fn,
+                shell=False  # CRITICAL: Never use shell=True
             )
 
             return result.returncode, result.stdout, result.stderr
@@ -214,16 +220,23 @@ class SecureToolExecutor:
 
         Returns:
             Path to created file
+
+        Raises:
+            ToolExecutionError: If temp directory not initialized
         """
         if not self.temp_dir:
             raise ToolExecutionError("Temp directory not initialized")
 
-        file_path = os.path.join(self.temp_dir, filename)
+        # Sanitize filename to prevent path traversal
+        safe_filename = Path(filename).name
+        file_path = self.temp_dir / safe_filename
 
-        with open(file_path, 'w') as f:
-            f.write(content)
-
-        return file_path
+        try:
+            file_path.write_text(content, encoding='utf-8')
+            logger.debug(f"Created input file: {file_path}")
+            return str(file_path)
+        except Exception as e:
+            raise ToolExecutionError(f"Failed to create input file: {e}") from e
 
     def read_output_file(self, filename: str) -> str:
         """
@@ -234,15 +247,34 @@ class SecureToolExecutor:
 
         Returns:
             File content
+
+        Raises:
+            ToolExecutionError: If temp directory not initialized
         """
         if not self.temp_dir:
             raise ToolExecutionError("Temp directory not initialized")
 
-        file_path = os.path.join(self.temp_dir, filename)
+        # Sanitize filename to prevent path traversal
+        safe_filename = Path(filename).name
+        file_path = self.temp_dir / safe_filename
 
-        if not os.path.exists(file_path):
+        if not file_path.exists():
             logger.warning(f"Output file not found: {file_path}")
             return ""
 
-        with open(file_path, 'r') as f:
-            return f.read()
+        try:
+            # Check file size to prevent reading huge files
+            file_size = file_path.stat().st_size
+            if file_size > self.max_output_size:
+                raise ToolExecutionError(
+                    f"Output file too large: {file_size} bytes (max: {self.max_output_size})"
+                )
+
+            content = file_path.read_text(encoding='utf-8')
+            logger.debug(f"Read output file: {file_path} ({file_size} bytes)")
+            return content
+        except UnicodeDecodeError:
+            logger.error(f"Failed to decode output file: {file_path}")
+            return ""
+        except Exception as e:
+            raise ToolExecutionError(f"Failed to read output file: {e}") from e

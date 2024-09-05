@@ -1,12 +1,26 @@
+"""
+Discovery pipeline tasks for asset enumeration
+
+Orchestrates discovery workflow across multiple tenants with isolation.
+Uses secure subprocess execution and batch database operations.
+"""
+
 from celery import chain, group
+import logging
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+
 from app.celery_app import celery
 from app.models.database import Tenant, Asset, Seed, Event, AssetType, EventKind
 from app.utils.storage import store_raw_output
-from datetime import datetime
-import subprocess
-import json
-import tempfile
-import os
+from app.utils.logger import TenantLoggerAdapter
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 @celery.task(name='app.tasks.discovery.run_full_discovery')
 def run_full_discovery():
@@ -19,7 +33,7 @@ def run_full_discovery():
 
     try:
         tenants = db.query(Tenant).all()
-        print(f"Orchestrating discovery for {len(tenants)} tenants")
+        logger.info(f"Orchestrating discovery for {len(tenants)} tenants")
 
         for tenant in tenants:
             # Each tenant gets isolated execution
@@ -29,7 +43,11 @@ def run_full_discovery():
                 routing_key=f'tenant.{tenant.id}.discovery'
             )
 
+        logger.info(f"Successfully queued discovery for {len(tenants)} tenants")
         return {'tenants_queued': len(tenants)}
+    except Exception as e:
+        logger.error(f"Failed to orchestrate discovery: {e}", exc_info=True)
+        raise
     finally:
         db.close()
 
@@ -45,10 +63,11 @@ def run_tenant_discovery(tenant_id: int):
     try:
         tenant = db.query(Tenant).filter_by(id=tenant_id).first()
         if not tenant:
-            print(f"Tenant {tenant_id} not found, skipping discovery")
+            logger.warning(f"Tenant {tenant_id} not found, skipping discovery")
             return {'error': 'tenant_not_found'}
 
-        print(f"Starting isolated discovery for tenant {tenant_id}: {tenant.name}")
+        tenant_logger = TenantLoggerAdapter(logger, {'tenant_id': tenant_id})
+        tenant_logger.info(f"Starting isolated discovery for tenant: {tenant.name}")
 
         # Run discovery chain with proper error handling
         try:
@@ -59,13 +78,14 @@ def run_tenant_discovery(tenant_id: int):
                 process_discovery_results.s(tenant_id)
             ).apply_async(queue=f'tenant_{tenant_id}')
 
+            tenant_logger.info("Discovery chain started successfully")
             return {
                 'tenant_id': tenant_id,
                 'tenant_name': tenant.name,
                 'status': 'started'
             }
         except Exception as e:
-            print(f"Error starting discovery chain for tenant {tenant_id}: {e}")
+            tenant_logger.error(f"Error starting discovery chain: {e}", exc_info=True)
             return {
                 'tenant_id': tenant_id,
                 'status': 'failed',
@@ -87,7 +107,7 @@ def watch_critical_assets():
             Asset.is_active == True
         ).all()
 
-        print(f"Watching {len(critical_assets)} critical assets")
+        logger.info(f"Watching {len(critical_assets)} critical assets")
 
         # Group by tenant and run quick checks
         tenant_assets = {}
@@ -139,7 +159,7 @@ def collect_seeds(tenant_id: int):
     try:
         tenant = db.query(Tenant).filter_by(id=tenant_id).first()
         if not tenant:
-            print(f"Tenant {tenant_id} not found")
+            logger.warning(f"Tenant {tenant_id} not found in collect_seeds")
             return {'domains': [], 'asns': [], 'ip_ranges': [], 'keywords': []}
 
         seeds = db.query(Seed).filter_by(tenant_id=tenant_id, enabled=True).all()
@@ -161,25 +181,27 @@ def collect_seeds(tenant_id: int):
             elif seed.type == 'keyword':
                 seed_data['keywords'].append(seed.value)
 
-        print(f"Collected seeds for tenant {tenant_id}: {len(seed_data['domains'])} domains, "
-              f"{len(seed_data['keywords'])} keywords")
+        logger.info(
+            f"Collected seeds for tenant {tenant_id}: {len(seed_data['domains'])} domains, "
+            f"{len(seed_data['keywords'])} keywords"
+        )
 
         # Run uncover if keywords are present and API keys configured
         if seed_data['keywords'] and tenant.api_keys:
             try:
                 uncover_results = run_uncover(tenant_id, seed_data['keywords'])
                 seed_data['domains'].extend(uncover_results)
-                print(f"Uncover discovered {len(uncover_results)} additional domains")
+                logger.info(f"Uncover discovered {len(uncover_results)} additional domains for tenant {tenant_id}")
             except Exception as e:
-                print(f"Uncover failed: {e}")
+                logger.error(f"Uncover failed for tenant {tenant_id}: {e}", exc_info=True)
 
         return seed_data
     finally:
         db.close()
 
-def run_uncover(tenant_id: int, keywords: list) -> list:
+def run_uncover(tenant_id: int, keywords: List[str]) -> List[str]:
     """
-    Run uncover for OSINT discovery
+    Run uncover for OSINT discovery using secure execution
 
     Args:
         tenant_id: Tenant ID
@@ -188,34 +210,50 @@ def run_uncover(tenant_id: int, keywords: list) -> list:
     Returns:
         List of discovered domains/IPs
     """
+    from app.utils.secure_executor import SecureToolExecutor, ToolExecutionError
+
+    if not settings.feature_uncover_enabled:
+        logger.info(f"Uncover is disabled, skipping for tenant {tenant_id}")
+        return []
+
     results = []
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        output_file = f.name
-
     try:
-        for keyword in keywords:
-            cmd = [
-                'uncover',
-                '-q', f'org:"{keyword}"',
-                '-e', 'shodan,censys',
-                '-silent',
-                '-o', output_file
-            ]
+        with SecureToolExecutor(tenant_id) as executor:
+            for keyword in keywords:
+                # Sanitize keyword - only allow alphanumeric, spaces, hyphens, underscores
+                safe_keyword = ''.join(c for c in keyword if c.isalnum() or c in ' -_')
+                if not safe_keyword:
+                    logger.warning(f"Skipping invalid keyword: {keyword}")
+                    continue
 
-            print(f"Running uncover for keyword: {keyword}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                logger.info(f"Running uncover for keyword: {safe_keyword} (tenant {tenant_id})")
 
-            if result.returncode != 0:
-                print(f"Uncover error: {result.stderr}")
+                # FIXED: Use secure executor instead of direct subprocess
+                # Prevents command injection through keyword parameter
+                try:
+                    returncode, stdout, stderr = executor.execute(
+                        'uncover',
+                        [
+                            '-q', f'org:"{safe_keyword}"',
+                            '-e', 'shodan,censys',
+                            '-silent'
+                        ],
+                        timeout=300
+                    )
 
-            # Read results
-            if os.path.exists(output_file):
-                with open(output_file, 'r') as f:
-                    for line in f:
+                    if returncode != 0:
+                        logger.warning(f"Uncover returned non-zero exit code for keyword '{safe_keyword}': {stderr}")
+
+                    # Parse stdout for results
+                    for line in stdout.split('\n'):
                         line = line.strip()
-                        if line:
+                        if line and not line.startswith('#'):
                             results.append(line)
+
+                except ToolExecutionError as e:
+                    logger.error(f"Uncover execution failed for keyword '{safe_keyword}': {e}")
+                    continue
 
         # Deduplicate
         results = list(set(results))
@@ -223,16 +261,12 @@ def run_uncover(tenant_id: int, keywords: list) -> list:
         # Store raw output in MinIO
         store_raw_output(tenant_id, 'uncover', {'keywords': keywords, 'results': results})
 
+        logger.info(f"Uncover completed for tenant {tenant_id}: {len(results)} unique results")
         return results
-    except subprocess.TimeoutExpired:
-        print(f"Uncover timeout for keywords: {keywords}")
-        return results
+
     except Exception as e:
-        print(f"Uncover error: {e}")
+        logger.error(f"Uncover error for tenant {tenant_id}: {e}", exc_info=True)
         return results
-    finally:
-        if os.path.exists(output_file):
-            os.unlink(output_file)
 
 @celery.task(name='app.tasks.discovery.run_subfinder')
 def run_subfinder(seed_data: dict, tenant_id: int):
@@ -249,7 +283,7 @@ def run_subfinder(seed_data: dict, tenant_id: int):
     from app.utils.secure_executor import SecureToolExecutor, ToolExecutionError
 
     if not seed_data.get('domains'):
-        print(f"No domains to scan for tenant {tenant_id}")
+        logger.info(f"No domains to scan for tenant {tenant_id}")
         return {'subdomains': [], 'tenant_id': tenant_id}
 
     try:
@@ -261,7 +295,7 @@ def run_subfinder(seed_data: dict, tenant_id: int):
             output_file = 'subdomains.txt'
 
             # Execute subfinder with resource limits
-            print(f"Running subfinder for {len(seed_data['domains'])} domains (tenant {tenant_id})")
+            logger.info(f"Running subfinder for {len(seed_data['domains'])} domains (tenant {tenant_id})")
 
             returncode, stdout, stderr = executor.execute(
                 'subfinder',
@@ -272,17 +306,17 @@ def run_subfinder(seed_data: dict, tenant_id: int):
                     '-silent',
                     '-o', output_file
                 ],
-                timeout=600
+                timeout=settings.discovery_subfinder_timeout
             )
 
             if returncode != 0:
-                print(f"Subfinder warning (tenant {tenant_id}): {stderr}")
+                logger.warning(f"Subfinder warning (tenant {tenant_id}): {stderr}")
 
             # Read results securely
             output_content = executor.read_output_file(output_file)
             subdomains = [line.strip() for line in output_content.split('\n') if line.strip()]
 
-            print(f"Subfinder found {len(subdomains)} subdomains (tenant {tenant_id})")
+            logger.info(f"Subfinder found {len(subdomains)} subdomains (tenant {tenant_id})")
 
             # Store raw output
             store_raw_output(tenant_id, 'subfinder', {
@@ -296,10 +330,10 @@ def run_subfinder(seed_data: dict, tenant_id: int):
             }
 
     except ToolExecutionError as e:
-        print(f"Subfinder execution error (tenant {tenant_id}): {e}")
+        logger.error(f"Subfinder execution error (tenant {tenant_id}): {e}", exc_info=True)
         return {'subdomains': [], 'tenant_id': tenant_id, 'error': str(e)}
     except Exception as e:
-        print(f"Subfinder unexpected error (tenant {tenant_id}): {e}")
+        logger.error(f"Subfinder unexpected error (tenant {tenant_id}): {e}", exc_info=True)
         return {'subdomains': [], 'tenant_id': tenant_id, 'error': str(e)}
 
 @celery.task(name='app.tasks.discovery.run_dnsx')
@@ -317,46 +351,48 @@ def run_dnsx(subfinder_result: dict, tenant_id: int):
     subdomains = subfinder_result.get('subdomains', [])
 
     if not subdomains:
-        print(f"No subdomains to resolve for tenant {tenant_id}")
+        logger.info(f"No subdomains to resolve for tenant {tenant_id}")
         return {'resolved': [], 'tenant_id': tenant_id}
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        subdomains_file = f.name
-        f.write('\n'.join(subdomains))
-
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        output_file = f.name
+    subdomains_file = None
+    output_file = None
 
     try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            subdomains_file = Path(f.name)
+            f.write('\n'.join(subdomains))
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            output_file = Path(f.name)
         cmd = [
             'dnsx',
-            '-l', subdomains_file,
+            '-l', str(subdomains_file),
             '-a', '-aaaa', '-cname', '-mx', '-ns', '-txt',
             '-resp',
             '-json',
             '-silent',
-            '-o', output_file
+            '-o', str(output_file)
         ]
 
-        print(f"Running dnsx for {len(subdomains)} subdomains")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        logger.info(f"Running dnsx for {len(subdomains)} subdomains (tenant {tenant_id})")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.discovery_dnsx_timeout)
 
         if result.returncode != 0:
-            print(f"Dnsx error: {result.stderr}")
+            logger.warning(f"Dnsx error (tenant {tenant_id}): {result.stderr}")
 
         # Parse results
         resolved_records = []
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f:
+        if output_file and output_file.exists():
+            with output_file.open('r') as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         try:
                             resolved_records.append(json.loads(line))
                         except json.JSONDecodeError:
-                            print(f"Failed to parse dnsx line: {line}")
+                            logger.warning(f"Failed to parse dnsx line: {line}")
 
-        print(f"Dnsx resolved {len(resolved_records)} records")
+        logger.info(f"Dnsx resolved {len(resolved_records)} records (tenant {tenant_id})")
 
         # Store raw output
         store_raw_output(tenant_id, 'dnsx', resolved_records)
@@ -366,43 +402,62 @@ def run_dnsx(subfinder_result: dict, tenant_id: int):
             'tenant_id': tenant_id
         }
     except subprocess.TimeoutExpired:
-        print(f"Dnsx timeout")
+        logger.error(f"Dnsx timeout for tenant {tenant_id}")
         return {'resolved': [], 'tenant_id': tenant_id}
     except Exception as e:
-        print(f"Dnsx error: {e}")
+        logger.error(f"Dnsx error for tenant {tenant_id}: {e}", exc_info=True)
         return {'resolved': [], 'tenant_id': tenant_id}
     finally:
-        if os.path.exists(subdomains_file):
-            os.unlink(subdomains_file)
-        if os.path.exists(output_file):
-            os.unlink(output_file)
+        # Cleanup temporary files
+        if subdomains_file and subdomains_file.exists():
+            try:
+                subdomains_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup subdomains file: {e}")
+        if output_file and output_file.exists():
+            try:
+                output_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup output file: {e}")
 
-def run_dnsx_for_assets(tenant_id: int, assets: list):
-    """Helper function to run dnsx on specific assets"""
+def run_dnsx_for_assets(tenant_id: int, assets: list) -> Dict:
+    """
+    Helper function to run dnsx on specific assets
+
+    Args:
+        tenant_id: Tenant ID
+        assets: List of Asset objects
+
+    Returns:
+        Dict with resolved records
+    """
     identifiers = [a.identifier for a in assets]
-
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        hosts_file = f.name
-        f.write('\n'.join(identifiers))
-
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        output_file = f.name
+    hosts_file = None
+    output_file = None
 
     try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            hosts_file = Path(f.name)
+            f.write('\n'.join(identifiers))
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            output_file = Path(f.name)
+
         cmd = [
             'dnsx',
-            '-l', hosts_file,
+            '-l', str(hosts_file),
             '-a', '-resp',
             '-json',
             '-silent',
-            '-o', output_file
+            '-o', str(output_file)
         ]
 
+        logger.debug(f"Running quick dnsx check for {len(identifiers)} assets (tenant {tenant_id})")
         subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         resolved_records = []
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f:
+        if output_file and output_file.exists():
+            with output_file.open('r') as f:
                 for line in f:
                     if line.strip():
                         try:
@@ -411,11 +466,21 @@ def run_dnsx_for_assets(tenant_id: int, assets: list):
                             pass
 
         return {'resolved': resolved_records}
+    except Exception as e:
+        logger.error(f"Quick dnsx check failed for tenant {tenant_id}: {e}")
+        return {'resolved': []}
     finally:
-        if os.path.exists(hosts_file):
-            os.unlink(hosts_file)
-        if os.path.exists(output_file):
-            os.unlink(output_file)
+        # Cleanup temporary files
+        if hosts_file and hosts_file.exists():
+            try:
+                hosts_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup hosts file: {e}")
+        if output_file and output_file.exists():
+            try:
+                output_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup output file: {e}")
 
 @celery.task(name='app.tasks.discovery.process_discovery_results')
 def process_discovery_results(dnsx_result: dict, tenant_id: int):
@@ -441,7 +506,7 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
 
     try:
         resolved = dnsx_result.get('resolved', [])
-        print(f"Processing {len(resolved)} resolved records for tenant {tenant_id} in batches of {BATCH_SIZE}")
+        logger.info(f"Processing {len(resolved)} resolved records for tenant {tenant_id} in batches of {BATCH_SIZE}")
 
         asset_repo = AssetRepository(db)
         event_repo = EventRepository(db)
@@ -453,7 +518,9 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
         # Process in batches to avoid long transactions
         for i in range(0, len(resolved), BATCH_SIZE):
             batch = resolved[i:i + BATCH_SIZE]
-            print(f"Processing batch {i // BATCH_SIZE + 1}/{(len(resolved) + BATCH_SIZE - 1) // BATCH_SIZE}")
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(resolved) + BATCH_SIZE - 1) // BATCH_SIZE
+            logger.debug(f"Processing batch {batch_num}/{total_batches} for tenant {tenant_id}")
 
             # Prepare batch data
             assets_data = []
@@ -505,11 +572,11 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
 
         # Batch create events for new assets
         if new_asset_events:
-            print(f"Creating {len(new_asset_events)} new asset events")
+            logger.info(f"Creating {len(new_asset_events)} new asset events for tenant {tenant_id}")
             event_repo.create_batch(new_asset_events)
             db.commit()
 
-        print(f"Discovery complete: ~{total_created} assets processed (tenant {tenant_id})")
+        logger.info(f"Discovery complete: ~{total_created} assets processed (tenant {tenant_id})")
 
         return {
             'assets_processed': total_created,
@@ -521,7 +588,7 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
 
     except Exception as e:
         db.rollback()
-        print(f"Error processing discovery results (tenant {tenant_id}): {e}")
+        logger.error(f"Error processing discovery results (tenant {tenant_id}): {e}", exc_info=True)
         raise
     finally:
         db.close()
