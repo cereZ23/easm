@@ -33,6 +33,12 @@ class SecureToolExecutor:
     Prevents command injection and enforces resource limits
     """
 
+    # Default resource limits
+    DEFAULT_TIMEOUT = 300  # 5 minutes
+    DEFAULT_CPU_LIMIT = 600  # 10 minutes CPU time
+    DEFAULT_MEMORY_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB
+    DEFAULT_FILE_SIZE_LIMIT = 100 * 1024 * 1024  # 100MB
+
     def __init__(self, tenant_id: int):
         """
         Initialize executor for specific tenant
@@ -132,7 +138,7 @@ class SecureToolExecutor:
             resource.setrlimit(resource.RLIMIT_AS, (self.DEFAULT_MEMORY_LIMIT, self.DEFAULT_MEMORY_LIMIT))
 
             # File size limit (prevent filling disk)
-            resource.setrlimit(resource.RLIMIT_FSIZE, (100 * 1024 * 1024, 100 * 1024 * 1024))  # 100MB
+            resource.setrlimit(resource.RLIMIT_FSIZE, (self.DEFAULT_FILE_SIZE_LIMIT, self.DEFAULT_FILE_SIZE_LIMIT))
         except Exception as e:
             logger.warning(f"Could not set resource limits: {e}")
 

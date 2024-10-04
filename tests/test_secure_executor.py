@@ -129,7 +129,7 @@ class TestSecureToolExecutorContextManager:
         with executor as exec_ctx:
             assert exec_ctx.temp_dir is not None
             assert os.path.exists(exec_ctx.temp_dir)
-            assert 'tenant_1_' in exec_ctx.temp_dir
+            assert 'tenant_1_' in str(exec_ctx.temp_dir)
             temp_dir = exec_ctx.temp_dir
 
         # Directory should be cleaned up after exit

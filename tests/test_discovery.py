@@ -4,7 +4,7 @@ Tests for discovery tasks
 Sprint 1 basic tests
 """
 import pytest
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import patch, MagicMock, mock_open, call
 from app.tasks.discovery import (
     collect_seeds,
     run_subfinder,
@@ -20,14 +20,14 @@ def mock_db_session():
 
 def test_collect_seeds_basic():
     """Test seed collection with basic domains"""
-    with patch('app.tasks.discovery.SessionLocal') as mock_session:
+    with patch('app.database.SessionLocal') as mock_session:
         mock_db = MagicMock()
         mock_session.return_value = mock_db
 
         # Mock tenant
         mock_tenant = MagicMock()
         mock_tenant.id = 1
-        mock_tenant.api_keys = None
+        mock_tenant.osint_api_keys = None
         mock_db.query.return_value.filter_by.return_value.first.return_value = mock_tenant
 
         # Mock seeds
@@ -107,7 +107,7 @@ def test_process_discovery_results():
         'tenant_id': 1
     }
 
-    with patch('app.tasks.discovery.SessionLocal') as mock_session:
+    with patch('app.database.SessionLocal') as mock_session:
         mock_db = MagicMock()
         mock_session.return_value = mock_db
 
@@ -116,7 +116,7 @@ def test_process_discovery_results():
 
         result = process_discovery_results(dnsx_result, 1)
 
-        assert 'new_assets' in result
+        assert 'assets_processed' in result
         assert 'total_resolved' in result
         assert result['total_resolved'] == 2
 

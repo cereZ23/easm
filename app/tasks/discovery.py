@@ -96,31 +96,59 @@ def run_tenant_discovery(tenant_id: int):
 
 @celery.task(name='app.tasks.discovery.watch_critical_assets')
 def watch_critical_assets():
-    """Monitor critical assets (high risk score) more frequently"""
+    """
+    Monitor critical assets (high risk score) more frequently
+
+    OPTIMIZATION: Uses optimized query patterns and bulk operations
+    """
     from app.database import SessionLocal
+    from app.repositories.asset_repository import AssetRepository
+
     db = SessionLocal()
 
     try:
-        # Get assets with risk score > 50
-        critical_assets = db.query(Asset).filter(
-            Asset.risk_score > 50,
-            Asset.is_active == True
-        ).all()
+        # OPTIMIZATION: Query critical assets per tenant using optimized repository method
+        # This approach is more efficient than querying all tenants' assets at once
+        # because it uses the composite index (tenant_id, risk_score, is_active)
 
-        logger.info(f"Watching {len(critical_assets)} critical assets")
+        # First, get all active tenants
+        tenants = db.query(Tenant).all()
 
-        # Group by tenant and run quick checks
+        total_critical_assets = 0
         tenant_assets = {}
-        for asset in critical_assets:
-            if asset.tenant_id not in tenant_assets:
-                tenant_assets[asset.tenant_id] = []
-            tenant_assets[asset.tenant_id].append(asset.id)
 
+        # OPTIMIZATION: Use AssetRepository.get_critical_assets() which leverages indexes
+        # This is better than the previous direct query because:
+        # 1. Uses optimized repository method with proper indexing
+        # 2. Groups by tenant naturally for better cache locality
+        # 3. Can be parallelized per tenant if needed
+        asset_repo = AssetRepository(db)
+
+        for tenant in tenants:
+            # Get critical assets for this tenant using indexed query
+            # The composite index (tenant_id, risk_score, is_active) makes this very fast
+            critical_assets = asset_repo.get_critical_assets(
+                tenant_id=tenant.id,
+                risk_threshold=50.0,
+                eager_load_relations=False  # We only need IDs, not relationships
+            )
+
+            if critical_assets:
+                asset_ids = [asset.id for asset in critical_assets]
+                tenant_assets[tenant.id] = asset_ids
+                total_critical_assets += len(asset_ids)
+
+        logger.info(f"Watching {total_critical_assets} critical assets across {len(tenant_assets)} tenants")
+
+        # Dispatch quick checks per tenant
         for tenant_id, asset_ids in tenant_assets.items():
             # Quick DNS check for these assets
             quick_dns_check.apply_async(args=[tenant_id, asset_ids])
 
-        return {'critical_assets_checked': len(critical_assets)}
+        return {
+            'critical_assets_checked': total_critical_assets,
+            'tenants_with_critical_assets': len(tenant_assets)
+        }
     finally:
         db.close()
 
@@ -187,7 +215,7 @@ def collect_seeds(tenant_id: int):
         )
 
         # Run uncover if keywords are present and API keys configured
-        if seed_data['keywords'] and tenant.api_keys:
+        if seed_data['keywords'] and tenant.osint_api_keys:
             try:
                 uncover_results = run_uncover(tenant_id, seed_data['keywords'])
                 seed_data['domains'].extend(uncover_results)
@@ -549,16 +577,23 @@ def process_discovery_results(dnsx_result: dict, tenant_id: int):
             result = asset_repo.bulk_upsert(tenant_id, assets_data)
             total_created += result['created']
 
-            # For new assets, we'll create events in a follow-up query
-            # This is a simplification - in production you'd want to track which are truly new
-            # For now, we'll create events for all in this batch as an approximation
+            # OPTIMIZATION: Fetch all assets in this batch with a single query instead of N queries
+            # This eliminates the N+1 query problem - 1 query per batch instead of 1 query per asset
+            identifiers_by_type = {}
             for data in assets_data:
-                # Get the asset to create event
-                asset = asset_repo.get_by_identifier(
-                    tenant_id,
-                    data['identifier'],
-                    data['type']
-                )
+                key = data['type']
+                if key not in identifiers_by_type:
+                    identifiers_by_type[key] = []
+                identifiers_by_type[key].append(data['identifier'])
+
+            # Bulk fetch all assets for this batch using a single query with IN clause
+            asset_lookup = asset_repo.get_by_identifiers_bulk(tenant_id, identifiers_by_type)
+
+            # Now check which assets are new and create events
+            for data in assets_data:
+                lookup_key = (data['identifier'], data['type'])
+                asset = asset_lookup.get(lookup_key)
+
                 if asset:
                     # Check if this is a newly seen asset (first_seen == last_seen within 1 second)
                     if asset.first_seen and asset.last_seen:

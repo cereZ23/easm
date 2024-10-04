@@ -16,7 +16,9 @@ from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.models.database import (
+# Import all models to ensure they're registered with SQLAlchemy
+import app.models
+from app.models import (
     Base, Tenant, Asset, Seed, Event, Service, Finding,
     AssetType, EventKind, FindingSeverity, FindingStatus
 )
@@ -75,7 +77,7 @@ def tenant(db_session):
         name="Test Tenant",
         slug="test-tenant",
         contact_policy="security@test.com",
-        api_keys=None
+        osint_api_keys=None
     )
     db_session.add(tenant)
     db_session.commit()
@@ -90,7 +92,7 @@ def tenant_with_api_keys(db_session):
         name="Tenant With Keys",
         slug="tenant-keys",
         contact_policy="security@test.com",
-        api_keys='{"shodan": "test_key", "censys": "test_key"}'
+        osint_api_keys='{"shodan": "test_key", "censys": "test_key"}'
     )
     db_session.add(tenant)
     db_session.commit()

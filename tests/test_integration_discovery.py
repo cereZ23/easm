@@ -78,7 +78,7 @@ def sample_seeds(test_db, sample_tenant):
 class TestDiscoveryPipelineIntegration:
     """Test complete discovery pipeline"""
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_collect_seeds_integration(self, mock_session_local, test_db, sample_tenant, sample_seeds):
         """Test seed collection with real database"""
         mock_session_local.return_value = test_db
@@ -94,7 +94,7 @@ class TestDiscoveryPipelineIntegration:
         assert 'TestCorp' in result['keywords']
         assert 'AS12345' in result['asns']
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_collect_seeds_disabled_seeds_excluded(self, mock_session_local, test_db, sample_tenant):
         """Test that disabled seeds are not collected"""
         mock_session_local.return_value = test_db
@@ -173,7 +173,7 @@ class TestDiscoveryPipelineIntegration:
             if os.path.exists(output_file):
                 os.unlink(output_file)
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     @patch('app.tasks.discovery.store_raw_output')
     def test_process_discovery_results_integration(self, mock_store, mock_session_local, test_db, sample_tenant):
         """Test processing discovery results with real database"""
@@ -202,7 +202,7 @@ class TestDiscoveryPipelineIntegration:
         assert 'sub2.example.com' in identifiers
         assert 'sub3.example.com' in identifiers
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_full_pipeline_chain(self, mock_session_local, test_db, sample_tenant, sample_seeds):
         """Test complete discovery pipeline chain"""
         mock_session_local.return_value = test_db
@@ -259,7 +259,7 @@ class TestDiscoveryPipelineIntegration:
 class TestDatabaseOperationsIntegration:
     """Test database operations with real database"""
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_asset_upsert_creates_new(self, mock_session_local, test_db, sample_tenant):
         """Test upserting new assets"""
         mock_session_local.return_value = test_db
@@ -280,7 +280,7 @@ class TestDatabaseOperationsIntegration:
         assert asset1 is not None
         assert asset1.identifier == 'new1.example.com'
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_asset_upsert_updates_existing(self, mock_session_local, test_db, sample_tenant):
         """Test upserting existing assets updates them"""
         mock_session_local.return_value = test_db
@@ -366,7 +366,7 @@ class TestDatabaseOperationsIntegration:
 class TestMultiTenantIsolation:
     """Test multi-tenant isolation in discovery pipeline"""
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_tenant_data_isolation(self, mock_session_local, test_db):
         """Test that tenant data is properly isolated"""
         mock_session_local.return_value = test_db
@@ -411,7 +411,7 @@ class TestMultiTenantIsolation:
         assert 'tenant2-sub1.com' in t2_identifiers
         assert 'tenant2-sub1.com' not in t1_identifiers
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_cross_tenant_access_prevented(self, mock_session_local, test_db):
         """Test that cross-tenant access is prevented"""
         mock_session_local.return_value = test_db
@@ -443,7 +443,7 @@ class TestMultiTenantIsolation:
 class TestErrorRecoveryIntegration:
     """Test error recovery in discovery pipeline"""
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_partial_failure_recovery(self, mock_session_local, test_db, sample_tenant):
         """Test that partial failures don't corrupt database"""
         mock_session_local.return_value = test_db
@@ -471,7 +471,7 @@ class TestErrorRecoveryIntegration:
         asset = repo.get_by_identifier(sample_tenant.id, 'good1.com', AssetType.SUBDOMAIN)
         assert asset is not None
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     @patch('app.utils.secure_executor.SecureToolExecutor.execute')
     def test_tool_execution_failure_handling(self, mock_execute, mock_session_local, test_db, sample_tenant):
         """Test handling of tool execution failures"""
@@ -491,7 +491,7 @@ class TestErrorRecoveryIntegration:
         assert result['subdomains'] == []
         assert 'error' in result
 
-    @patch('app.tasks.discovery.SessionLocal')
+    @patch('app.database.SessionLocal')
     def test_empty_results_handling(self, mock_session_local, test_db, sample_tenant):
         """Test handling of empty discovery results"""
         mock_session_local.return_value = test_db
