@@ -4,6 +4,9 @@ from datetime import datetime
 import json
 import os
 import io
+import logging
+
+logger = logging.getLogger(__name__)
 
 def get_minio_client():
     """Get MinIO client instance"""
@@ -19,9 +22,9 @@ def ensure_bucket_exists(client, bucket_name):
     try:
         if not client.bucket_exists(bucket_name):
             client.make_bucket(bucket_name)
-            print(f"Created bucket: {bucket_name}")
+            logger.info(f"Created bucket: {bucket_name}")
     except S3Error as e:
-        print(f"Error ensuring bucket exists: {e}")
+        logger.error(f"Error ensuring bucket exists: {e}", exc_info=True)
         raise
 
 def store_raw_output(tenant_id: int, tool: str, data: any):
@@ -60,10 +63,10 @@ def store_raw_output(tenant_id: int, tool: str, data: any):
             length=len(data_bytes),
             content_type='application/json'
         )
-        print(f"Stored {tool} output to {bucket_name}/{object_name}")
+        logger.info(f"Stored {tool} output to {bucket_name}/{object_name}")
         return object_name
     except S3Error as e:
-        print(f"Error storing output: {e}")
+        logger.error(f"Error storing output: {e}", exc_info=True)
         raise
 
 def retrieve_raw_output(tenant_id: int, object_name: str):
@@ -85,7 +88,7 @@ def retrieve_raw_output(tenant_id: int, object_name: str):
         data = response.read()
         return json.loads(data.decode('utf-8'))
     except S3Error as e:
-        print(f"Error retrieving output: {e}")
+        logger.error(f"Error retrieving output: {e}", exc_info=True)
         raise
     finally:
         if response:
@@ -126,5 +129,5 @@ def list_tool_outputs(tenant_id: int, tool: str, limit: int = 10):
 
         return results
     except S3Error as e:
-        print(f"Error listing outputs: {e}")
+        logger.error(f"Error listing outputs: {e}", exc_info=True)
         return []

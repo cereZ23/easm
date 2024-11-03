@@ -8,7 +8,6 @@ Uses secure subprocess execution and batch database operations.
 from celery import chain, group
 import logging
 import json
-import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -367,7 +366,7 @@ def run_subfinder(seed_data: dict, tenant_id: int):
 @celery.task(name='app.tasks.discovery.run_dnsx')
 def run_dnsx(subfinder_result: dict, tenant_id: int):
     """
-    Run dnsx for DNS resolution
+    Run dnsx for DNS resolution using secure executor
 
     Args:
         subfinder_result: Result from run_subfinder
@@ -376,81 +375,73 @@ def run_dnsx(subfinder_result: dict, tenant_id: int):
     Returns:
         Dict with resolved records
     """
+    from app.utils.secure_executor import SecureToolExecutor, ToolExecutionError
+
     subdomains = subfinder_result.get('subdomains', [])
 
     if not subdomains:
         logger.info(f"No subdomains to resolve for tenant {tenant_id}")
         return {'resolved': [], 'tenant_id': tenant_id}
 
-    subdomains_file = None
-    output_file = None
-
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            subdomains_file = Path(f.name)
-            f.write('\n'.join(subdomains))
+        # Use secure executor with automatic cleanup
+        with SecureToolExecutor(tenant_id) as executor:
+            # Create input file securely
+            subdomains_content = '\n'.join(subdomains)
+            input_file = executor.create_input_file('subdomains.txt', subdomains_content)
+            output_file = 'dnsx_results.json'
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            output_file = Path(f.name)
-        cmd = [
-            'dnsx',
-            '-l', str(subdomains_file),
-            '-a', '-aaaa', '-cname', '-mx', '-ns', '-txt',
-            '-resp',
-            '-json',
-            '-silent',
-            '-o', str(output_file)
-        ]
+            # Execute dnsx with resource limits
+            logger.info(f"Running dnsx for {len(subdomains)} subdomains (tenant {tenant_id})")
 
-        logger.info(f"Running dnsx for {len(subdomains)} subdomains (tenant {tenant_id})")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=settings.discovery_dnsx_timeout)
+            returncode, stdout, stderr = executor.execute(
+                'dnsx',
+                [
+                    '-l', input_file,
+                    '-a', '-aaaa', '-cname', '-mx', '-ns', '-txt',
+                    '-resp',
+                    '-json',
+                    '-silent',
+                    '-o', output_file
+                ],
+                timeout=settings.discovery_dnsx_timeout
+            )
 
-        if result.returncode != 0:
-            logger.warning(f"Dnsx error (tenant {tenant_id}): {result.stderr}")
+            if returncode != 0:
+                logger.warning(f"Dnsx warning (tenant {tenant_id}): {stderr}")
 
-        # Parse results
-        resolved_records = []
-        if output_file and output_file.exists():
-            with output_file.open('r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            resolved_records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse dnsx line: {line}")
+            # Read results securely
+            output_content = executor.read_output_file(output_file)
+            resolved_records = []
 
-        logger.info(f"Dnsx resolved {len(resolved_records)} records (tenant {tenant_id})")
+            for line in output_content.split('\n'):
+                line = line.strip()
+                if line:
+                    try:
+                        resolved_records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse dnsx line: {line}")
 
-        # Store raw output
-        store_raw_output(tenant_id, 'dnsx', resolved_records)
+            logger.info(f"Dnsx resolved {len(resolved_records)} records (tenant {tenant_id})")
 
-        return {
-            'resolved': resolved_records,
-            'tenant_id': tenant_id
-        }
-    except subprocess.TimeoutExpired:
-        logger.error(f"Dnsx timeout for tenant {tenant_id}")
-        return {'resolved': [], 'tenant_id': tenant_id}
+            # Store raw output
+            store_raw_output(tenant_id, 'dnsx', resolved_records)
+
+            return {
+                'resolved': resolved_records,
+                'tenant_id': tenant_id
+            }
+
+    except ToolExecutionError as e:
+        logger.error(f"Dnsx execution error (tenant {tenant_id}): {e}", exc_info=True)
+        return {'resolved': [], 'tenant_id': tenant_id, 'error': str(e)}
     except Exception as e:
-        logger.error(f"Dnsx error for tenant {tenant_id}: {e}", exc_info=True)
-        return {'resolved': [], 'tenant_id': tenant_id}
-    finally:
-        # Cleanup temporary files
-        if subdomains_file and subdomains_file.exists():
-            try:
-                subdomains_file.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup subdomains file: {e}")
-        if output_file and output_file.exists():
-            try:
-                output_file.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup output file: {e}")
+        logger.error(f"Dnsx unexpected error (tenant {tenant_id}): {e}", exc_info=True)
+        return {'resolved': [], 'tenant_id': tenant_id, 'error': str(e)}
 
 def run_dnsx_for_assets(tenant_id: int, assets: list) -> Dict:
     """
-    Helper function to run dnsx on specific assets
+    Helper function to run dnsx on specific assets using secure executor
 
     Args:
         tenant_id: Tenant ID
@@ -459,56 +450,51 @@ def run_dnsx_for_assets(tenant_id: int, assets: list) -> Dict:
     Returns:
         Dict with resolved records
     """
+    from app.utils.secure_executor import SecureToolExecutor, ToolExecutionError
+
     identifiers = [a.identifier for a in assets]
-    hosts_file = None
-    output_file = None
 
     try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            hosts_file = Path(f.name)
-            f.write('\n'.join(identifiers))
+        # Use secure executor with automatic cleanup
+        with SecureToolExecutor(tenant_id) as executor:
+            # Create input file securely
+            hosts_content = '\n'.join(identifiers)
+            input_file = executor.create_input_file('critical_assets.txt', hosts_content)
+            output_file = 'quick_dnsx.json'
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            output_file = Path(f.name)
+            logger.debug(f"Running quick dnsx check for {len(identifiers)} assets (tenant {tenant_id})")
 
-        cmd = [
-            'dnsx',
-            '-l', str(hosts_file),
-            '-a', '-resp',
-            '-json',
-            '-silent',
-            '-o', str(output_file)
-        ]
+            returncode, stdout, stderr = executor.execute(
+                'dnsx',
+                [
+                    '-l', input_file,
+                    '-a', '-resp',
+                    '-json',
+                    '-silent',
+                    '-o', output_file
+                ],
+                timeout=300
+            )
 
-        logger.debug(f"Running quick dnsx check for {len(identifiers)} assets (tenant {tenant_id})")
-        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            # Read results securely
+            output_content = executor.read_output_file(output_file)
+            resolved_records = []
 
-        resolved_records = []
-        if output_file and output_file.exists():
-            with output_file.open('r') as f:
-                for line in f:
-                    if line.strip():
-                        try:
-                            resolved_records.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
+            for line in output_content.split('\n'):
+                if line.strip():
+                    try:
+                        resolved_records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
 
-        return {'resolved': resolved_records}
+            return {'resolved': resolved_records}
+
+    except ToolExecutionError as e:
+        logger.error(f"Quick dnsx check failed for tenant {tenant_id}: {e}")
+        return {'resolved': []}
     except Exception as e:
         logger.error(f"Quick dnsx check failed for tenant {tenant_id}: {e}")
         return {'resolved': []}
-    finally:
-        # Cleanup temporary files
-        if hosts_file and hosts_file.exists():
-            try:
-                hosts_file.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup hosts file: {e}")
-        if output_file and output_file.exists():
-            try:
-                output_file.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to cleanup output file: {e}")
 
 @celery.task(name='app.tasks.discovery.process_discovery_results')
 def process_discovery_results(dnsx_result: dict, tenant_id: int):

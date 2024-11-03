@@ -67,11 +67,16 @@ services:
       minio:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
-      REDIS_URL: redis://redis:6379/0
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: easm
+      POSTGRES_USER: easm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-easm_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       MINIO_ENDPOINT: minio:9000
-      MINIO_USER: ${MINIO_USER:-minioadmin}
-      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin123}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-secret-key-in-production}
     ports:
       - "18000:8000"
@@ -93,11 +98,16 @@ services:
       minio:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
-      REDIS_URL: redis://redis:6379/0
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: easm
+      POSTGRES_USER: easm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-easm_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       MINIO_ENDPOINT: minio:9000
-      MINIO_USER: ${MINIO_USER:-minioadmin}
-      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin123}
     volumes:
       - ./app:/app/app
       - ./nuclei-templates:/root/nuclei-templates
@@ -114,11 +124,16 @@ services:
       - redis
       - postgres
     environment:
-      DATABASE_URL: postgresql://easm:${DB_PASSWORD:-easm_password}@postgres:5432/easm
-      REDIS_URL: redis://redis:6379/0
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: easm
+      POSTGRES_USER: easm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-easm_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       MINIO_ENDPOINT: minio:9000
-      MINIO_USER: ${MINIO_USER:-minioadmin}
-      MINIO_PASSWORD: ${MINIO_PASSWORD:-minioadmin123}
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin123}
     volumes:
       - ./app:/app/app
     networks:

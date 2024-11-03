@@ -7,6 +7,7 @@ sensitive defaults.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 from typing import Optional
 from pathlib import Path
 
@@ -149,6 +150,64 @@ class Settings(BaseSettings):
     feature_uncover_enabled: bool = True
     feature_nuclei_enabled: bool = True
     feature_notifications_enabled: bool = False
+
+    @model_validator(mode='after')
+    def validate_production_secrets(self):
+        """
+        Validate that production secrets have been changed from defaults
+
+        Raises:
+            ValueError: If production environment has weak/default secrets
+        """
+        if self.environment == 'production':
+            errors = []
+
+            # Check SECRET_KEY
+            if 'CHANGE_THIS' in self.secret_key or len(self.secret_key) < 32:
+                errors.append(
+                    "SECRET_KEY must be set with a strong random value (min 32 chars) in production. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+                )
+
+            # Check JWT_SECRET_KEY
+            if 'CHANGE_THIS' in self.jwt_secret_key or len(self.jwt_secret_key) < 32:
+                errors.append(
+                    "JWT_SECRET_KEY must be set with a strong random value (min 32 chars) in production. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+                )
+
+            # Check database password
+            if self.postgres_password in ['easm_dev_password', 'password', '123456', 'admin']:
+                errors.append(
+                    "POSTGRES_PASSWORD must be set with a strong password in production"
+                )
+
+            # Check MinIO credentials
+            if self.minio_access_key == 'minioadmin' or self.minio_secret_key == 'minioadmin':
+                errors.append(
+                    "MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be changed from defaults in production"
+                )
+
+            # Check CORS configuration
+            if "*" in self.cors_origins:
+                errors.append(
+                    "CORS_ORIGINS must not include wildcard ('*') in production. "
+                    "Specify exact allowed origins."
+                )
+
+            if errors:
+                error_msg = "\n\n" + "="*80 + "\n"
+                error_msg += "PRODUCTION CONFIGURATION ERRORS DETECTED\n"
+                error_msg += "="*80 + "\n\n"
+                error_msg += "The following configuration issues MUST be fixed before deploying to production:\n\n"
+                for i, error in enumerate(errors, 1):
+                    error_msg += f"{i}. {error}\n\n"
+                error_msg += "="*80 + "\n"
+                error_msg += "Set ENVIRONMENT=development to bypass these checks for local development.\n"
+                error_msg += "="*80 + "\n"
+                raise ValueError(error_msg)
+
+        return self
 
 
 # Global settings instance

@@ -17,6 +17,15 @@ target_metadata = Base.metadata
 
 # Override sqlalchemy.url from environment if available
 database_url = os.getenv('DATABASE_URL')
+if not database_url:
+    # Construct from individual components if DATABASE_URL not set
+    postgres_host = os.getenv('POSTGRES_HOST', 'localhost')
+    postgres_port = os.getenv('POSTGRES_PORT', '5432')
+    postgres_db = os.getenv('POSTGRES_DB', 'easm')
+    postgres_user = os.getenv('POSTGRES_USER', 'easm')
+    postgres_password = os.getenv('POSTGRES_PASSWORD', 'easm_password')
+    database_url = f"postgresql://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
+
 if database_url:
     config.set_main_option('sqlalchemy.url', database_url)
 
