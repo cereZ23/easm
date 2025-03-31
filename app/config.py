@@ -124,6 +124,8 @@ class Settings(BaseSettings):
     # Discovery Pipeline
     discovery_batch_size: int = 100
     discovery_subfinder_timeout: int = 600
+    discovery_amass_timeout: int = 900  # Amass is slower, needs more time
+    discovery_amass_enabled: bool = True  # Enable/disable Amass enumeration
     discovery_dnsx_timeout: int = 600
     discovery_httpx_timeout: int = 900
     discovery_naabu_timeout: int = 1200

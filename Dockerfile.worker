@@ -60,6 +60,16 @@ RUN mkdir -p /tmp/pd-tools && \
              /usr/local/bin/naabu /usr/local/bin/katana /usr/local/bin/nuclei \
              /usr/local/bin/tlsx /usr/local/bin/uncover /usr/local/bin/notify
 
+# Install OWASP Amass (Sprint 1.7)
+# Amass is the industry-standard subdomain enumeration tool
+RUN mkdir -p /tmp/amass && \
+    cd /tmp/amass && \
+    wget -q https://github.com/owasp-amass/amass/releases/download/v4.2.0/amass_Linux_amd64.zip && \
+    unzip -qo amass_Linux_amd64.zip && \
+    mv amass_Linux_amd64/amass /usr/local/bin/ && \
+    chmod +x /usr/local/bin/amass && \
+    cd / && rm -rf /tmp/amass
+
 # Update Nuclei templates
 RUN nuclei -update-templates
 

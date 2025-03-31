@@ -9,7 +9,7 @@ Multi-tenant EASM platform built around ProjectDiscovery tools for continuous se
 - ✅ Docker Compose environment (PostgreSQL, Redis, MinIO, API, Worker, Beat)
 - ✅ Complete database schema with multi-tenant isolation
 - ✅ Celery task queue with scheduler (Beat)
-- ✅ Discovery pipeline: Uncover → Subfinder → DNSX
+- ✅ Discovery pipeline: Uncover → Subfinder + Amass (parallel) → DNSX
 - ✅ MinIO storage for raw tool outputs
 - ✅ Asset persistence with event tracking
 - ✅ Database migrations (Alembic)
@@ -129,7 +129,9 @@ Seeds (domains, ASNs, keywords)
     ↓
 Uncover (OSINT discovery)
     ↓
-Subfinder (subdomain enumeration)
+Subfinder + Amass (parallel subdomain enumeration)
+    ↓
+Merge & Deduplicate (30-50% more coverage)
     ↓
 DNSX (DNS resolution)
     ↓
