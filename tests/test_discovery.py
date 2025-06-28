@@ -350,3 +350,16 @@ def test_run_parallel_enumeration_amass_disabled():
         assert result['tenant_id'] == 1
         # Should call run_subfinder directly
         mock_subfinder.assert_called_once_with(seed_data, 1)
+
+# ==================== Sprint 1.7 - Integration Tests ====================
+
+def test_amass_in_allowed_tools_whitelist():
+    """CRITICAL: Verify Amass is in the allowed tools whitelist
+
+    This test ensures Amass can actually be executed by SecureToolExecutor.
+    If this test fails, all Amass executions will fail in production.
+    """
+    from app.config import settings
+
+    assert 'amass' in settings.tool_allowed_tools, \
+        "Amass must be in tool_allowed_tools whitelist for SecureToolExecutor to allow execution"

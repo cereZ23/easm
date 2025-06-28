@@ -118,7 +118,8 @@ class Settings(BaseSettings):
     tool_temp_dir: Optional[Path] = None
     tool_allowed_tools: set[str] = {
         'subfinder', 'dnsx', 'httpx', 'naabu',
-        'katana', 'nuclei', 'tlsx', 'uncover', 'notify'
+        'katana', 'nuclei', 'tlsx', 'uncover', 'notify',
+        'amass'  # Sprint 1.7: OWASP Amass for enhanced subdomain enumeration
     }
 
     # Discovery Pipeline
