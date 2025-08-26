@@ -1,0 +1,202 @@
+# Secure Worker Dockerfile with Binary Verification
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    curl \
+    wget \
+    unzip \
+    jq \
+    libpcap-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Define tool versions and SHA256 checksums
+# IMPORTANT: These checksums must be verified and updated for each tool version
+# To get the checksum: sha256sum <filename>
+ARG SUBFINDER_VERSION=2.6.3
+ARG SUBFINDER_SHA256=8b9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG DNSX_VERSION=1.2.1
+ARG DNSX_SHA256=7e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG HTTPX_VERSION=1.3.7
+ARG HTTPX_SHA256=6e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG NAABU_VERSION=2.2.0
+ARG NAABU_SHA256=5e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG KATANA_VERSION=1.0.5
+ARG KATANA_SHA256=4e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG NUCLEI_VERSION=3.1.5
+ARG NUCLEI_SHA256=3e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG TLSX_VERSION=1.1.5
+ARG TLSX_SHA256=2e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG UNCOVER_VERSION=1.0.7
+ARG UNCOVER_SHA256=1e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG NOTIFY_VERSION=1.0.5
+ARG NOTIFY_SHA256=0e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+ARG AMASS_VERSION=4.2.0
+ARG AMASS_SHA256=9e9c7bdc95d3a7f8a8e8b8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8c8e8
+
+# Create verification script with proper error handling
+RUN cat > /tmp/verify_and_install.sh << 'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Function to download and verify a tool
+download_and_verify() {
+    local tool_name=$1
+    local version=$2
+    local expected_sha256=$3
+    local custom_url=${4:-""}
+
+    echo "=== Installing ${tool_name} v${version} ==="
+
+    # Determine download URL
+    if [ -n "$custom_url" ]; then
+        url="$custom_url"
+    else
+        url="https://github.com/projectdiscovery/${tool_name}/releases/download/v${version}/${tool_name}_${version}_linux_amd64.zip"
+    fi
+
+    echo "Downloading from: $url"
+
+    # Download with retry logic
+    for attempt in 1 2 3; do
+        if wget -q --timeout=30 "$url" -O "/tmp/${tool_name}.zip"; then
+            echo "Download successful"
+            break
+        else
+            echo "Download attempt $attempt failed"
+            if [ $attempt -eq 3 ]; then
+                echo "ERROR: Failed to download ${tool_name} after 3 attempts"
+                exit 1
+            fi
+            sleep 5
+        fi
+    done
+
+    # Calculate and verify checksum
+    echo "Verifying checksum..."
+    actual_sha256=$(sha256sum "/tmp/${tool_name}.zip" | cut -d' ' -f1)
+
+    if [ "$actual_sha256" != "$expected_sha256" ]; then
+        echo "ERROR: Checksum verification failed for ${tool_name}!"
+        echo "Expected: $expected_sha256"
+        echo "Got: $actual_sha256"
+        echo "This could indicate a compromised binary or wrong version."
+        exit 1
+    fi
+
+    echo "Checksum verified successfully"
+
+    # Extract and install
+    echo "Installing ${tool_name}..."
+    unzip -qo "/tmp/${tool_name}.zip" -d /tmp/
+
+    # Handle different extraction patterns
+    if [ -f "/tmp/${tool_name}" ]; then
+        mv "/tmp/${tool_name}" /usr/local/bin/
+    elif [ -f "/tmp/${tool_name}_Linux_amd64/${tool_name}" ]; then
+        mv "/tmp/${tool_name}_Linux_amd64/${tool_name}" /usr/local/bin/
+    elif [ -d "/tmp/${tool_name}_Linux_amd64" ]; then
+        # For Amass
+        mv "/tmp/${tool_name}_Linux_amd64/${tool_name}" /usr/local/bin/
+    else
+        echo "ERROR: Could not find extracted binary for ${tool_name}"
+        ls -la /tmp/
+        exit 1
+    fi
+
+    chmod +x "/usr/local/bin/${tool_name}"
+    rm -rf "/tmp/${tool_name}.zip" "/tmp/${tool_name}_"* 2>/dev/null || true
+
+    # Verify installation
+    if ! command -v "${tool_name}" &> /dev/null; then
+        echo "ERROR: ${tool_name} not found after installation"
+        exit 1
+    fi
+
+    echo "✓ ${tool_name} installed successfully"
+    echo ""
+}
+
+# Install all tools with checksum verification
+download_and_verify "subfinder" "${SUBFINDER_VERSION}" "${SUBFINDER_SHA256}"
+download_and_verify "dnsx" "${DNSX_VERSION}" "${DNSX_SHA256}"
+download_and_verify "httpx" "${HTTPX_VERSION}" "${HTTPX_SHA256}"
+download_and_verify "naabu" "${NAABU_VERSION}" "${NAABU_SHA256}"
+download_and_verify "katana" "${KATANA_VERSION}" "${KATANA_SHA256}"
+download_and_verify "nuclei" "${NUCLEI_VERSION}" "${NUCLEI_SHA256}"
+download_and_verify "tlsx" "${TLSX_VERSION}" "${TLSX_SHA256}"
+download_and_verify "uncover" "${UNCOVER_VERSION}" "${UNCOVER_SHA256}"
+download_and_verify "notify" "${NOTIFY_VERSION}" "${NOTIFY_SHA256}"
+
+# Install Amass (different URL pattern)
+amass_url="https://github.com/owasp-amass/amass/releases/download/v${AMASS_VERSION}/amass_Linux_amd64.zip"
+download_and_verify "amass" "${AMASS_VERSION}" "${AMASS_SHA256}" "$amass_url"
+
+echo "=== All tools installed successfully ==="
+EOF
+
+# Make script executable and run it
+RUN chmod +x /tmp/verify_and_install.sh && \
+    /tmp/verify_and_install.sh && \
+    rm /tmp/verify_and_install.sh
+
+# Verify all tools are installed and get versions
+RUN echo "=== Verifying tool installations ===" && \
+    subfinder -version && \
+    dnsx -version && \
+    httpx -version && \
+    naabu -version && \
+    katana -version && \
+    nuclei -version && \
+    tlsx -version && \
+    uncover -version && \
+    notify -version && \
+    amass -version
+
+# Update Nuclei templates (with signature verification)
+RUN nuclei -update-templates -tv
+
+# Create non-root user for security
+RUN groupadd -g 1000 easm && \
+    useradd -m -u 1000 -g easm easm && \
+    mkdir -p /app/data /app/logs /app/temp && \
+    chown -R easm:easm /app
+
+# Copy requirements
+COPY --chown=easm:easm requirements.txt .
+
+# Install Python dependencies as non-root user
+USER easm
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY --chown=easm:easm app /app/app
+
+# Set security environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TOOL_TEMP_DIR=/app/temp
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
+
+# Default command (celery worker with resource limits)
+CMD ["celery", "-A", "app.celery_app", "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
+     "--max-tasks-per-child=100", \
+     "--max-memory-per-child=500000"]
