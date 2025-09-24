@@ -17,6 +17,7 @@ from app.celery_app import celery
 from app.models.database import Tenant, Asset, Seed, Event, AssetType, EventKind
 from app.utils.storage import store_raw_output
 from app.utils.logger import TenantLoggerAdapter
+from app.utils.validators import DomainValidator
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -368,16 +369,34 @@ def run_subfinder(seed_data: dict, tenant_id: int):
         logger.info(f"No domains to scan for tenant {tenant_id}")
         return {'subdomains': [], 'tenant_id': tenant_id}
 
+    # SECURITY: Validate all domains before processing (Sprint 2 - Critical Vulnerability Fix #2)
+    validator = DomainValidator()
+    validated_domains = []
+
+    for domain in seed_data['domains']:
+        is_valid, error_msg = validator.validate_domain(domain)
+        if is_valid:
+            # Domain is already normalized to lowercase by validator
+            validated_domains.append(domain.strip().lower())
+        else:
+            logger.warning(f"Invalid domain rejected by Subfinder (tenant {tenant_id}): {domain} - {error_msg}")
+
+    if not validated_domains:
+        logger.warning(f"No valid domains after validation for Subfinder (tenant {tenant_id})")
+        return {'subdomains': [], 'tenant_id': tenant_id}
+
+    logger.info(f"Validated {len(validated_domains)}/{len(seed_data['domains'])} domains for Subfinder (tenant {tenant_id})")
+
     try:
         # Use secure executor with automatic cleanup
         with SecureToolExecutor(tenant_id) as executor:
-            # Create input file securely
-            domains_content = '\n'.join(seed_data['domains'])
+            # Create input file securely with validated domains
+            domains_content = '\n'.join(validated_domains)
             input_file = executor.create_input_file('domains.txt', domains_content)
             output_file = 'subdomains.txt'
 
             # Execute subfinder with resource limits
-            logger.info(f"Running subfinder for {len(seed_data['domains'])} domains (tenant {tenant_id})")
+            logger.info(f"Running subfinder for {len(validated_domains)} validated domains (tenant {tenant_id})")
 
             returncode, stdout, stderr = executor.execute(
                 'subfinder',
@@ -402,7 +421,7 @@ def run_subfinder(seed_data: dict, tenant_id: int):
 
             # Store raw output
             store_raw_output(tenant_id, 'subfinder', {
-                'input_domains': seed_data['domains'],
+                'input_domains': validated_domains,
                 'subdomains': subdomains
             })
 
@@ -447,12 +466,30 @@ def run_amass(seed_data: dict, tenant_id: int):
         logger.info(f"Amass is disabled, skipping (tenant {tenant_id})")
         return {'subdomains': [], 'tenant_id': tenant_id, 'source': 'amass', 'skipped': True}
 
+    # SECURITY: Validate all domains before processing (Sprint 2 - Critical Vulnerability Fix #2)
+    validator = DomainValidator()
+    validated_domains = []
+
+    for domain in seed_data['domains']:
+        is_valid, error_msg = validator.validate_domain(domain)
+        if is_valid:
+            # Domain is already normalized to lowercase by validator
+            validated_domains.append(domain.strip().lower())
+        else:
+            logger.warning(f"Invalid domain rejected by Amass (tenant {tenant_id}): {domain} - {error_msg}")
+
+    if not validated_domains:
+        logger.warning(f"No valid domains after validation for Amass (tenant {tenant_id})")
+        return {'subdomains': [], 'tenant_id': tenant_id, 'source': 'amass'}
+
+    logger.info(f"Validated {len(validated_domains)}/{len(seed_data['domains'])} domains for Amass (tenant {tenant_id})")
+
     try:
         with SecureToolExecutor(tenant_id) as executor:
             all_subdomains = []
 
             # Run Amass for each domain (Amass works best with single domain at a time)
-            for domain in seed_data['domains']:
+            for domain in validated_domains:
                 output_file = f'amass_{domain}.json'
 
                 logger.info(f"Running Amass for domain: {domain} (tenant {tenant_id})")
@@ -498,7 +535,7 @@ def run_amass(seed_data: dict, tenant_id: int):
 
             # Store raw output
             store_raw_output(tenant_id, 'amass', {
-                'input_domains': seed_data['domains'],
+                'input_domains': validated_domains,
                 'subdomains': unique_subdomains,
                 'total_found': len(all_subdomains),
                 'unique_found': len(unique_subdomains)

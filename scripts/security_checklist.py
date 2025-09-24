@@ -56,7 +56,7 @@ class SecurityChecker:
         ]
 
         for check_name, check_func, points in checks:
-            self.max_score += points
+            self.results['max_score'] += points
             print(f"\n[CHECK] {check_name}...")
             try:
                 passed, message = check_func()
@@ -357,7 +357,7 @@ class SecurityChecker:
 
         print(f"\nPassed: {len(self.results['passed'])}")
         print(f"Failed: {len(self.results['failed'])}")
-        print(f"Score: {self.results['score']}/{self.max_score}")
+        print(f"Score: {self.results['score']}/{self.results['max_score']}")
 
         if self.results['failed']:
             print("\nFailed Checks:")
@@ -365,7 +365,7 @@ class SecurityChecker:
                 print(f"  - {check}")
 
         # Calculate security score
-        security_score = (self.results['score'] / self.max_score) * 10
+        security_score = (self.results['score'] / self.results['max_score']) * 10 if self.results['max_score'] > 0 else 0
 
         print(f"\n{'='*80}")
         print(f"SECURITY SCORE: {security_score:.1f}/10.0")

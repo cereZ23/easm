@@ -322,6 +322,19 @@ done
 
 ## Quick Commands
 
+### Generate Production Secrets (NEW - Sprint 2)
+```bash
+python scripts/generate_secrets.py
+```
+This generates all required secrets for production deployment:
+- SECRET_KEY (64 chars, cryptographically strong)
+- JWT_SECRET_KEY (64 chars, cryptographically strong)
+- POSTGRES_PASSWORD (32 chars)
+- REDIS_PASSWORD (24 chars)
+- MINIO_ACCESS_KEY / MINIO_SECRET_KEY
+
+**IMPORTANT**: Store these in a secure location and NEVER commit to version control.
+
 ### Generate Binary Checksums
 ```bash
 bash scripts/generate_checksums.sh

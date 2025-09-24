@@ -34,16 +34,18 @@ class Settings(BaseSettings):
     api_workers: int = 4
     api_reload: bool = False
 
-    # Security
-    secret_key: str = "CHANGE_THIS_IN_PRODUCTION"  # MUST be overridden in production
+    # Security (Sprint 2 - Critical Vulnerability Fix #3)
+    # IMPORTANT: These values MUST be set via environment variables in production
+    # Development fallback values provided for local testing only
+    secret_key: str = "dev_secret_key_INSECURE_DO_NOT_USE_IN_PRODUCTION_" + "x" * 32
     api_key_header: str = "X-API-Key"
     cors_origins: list[str] = ["http://localhost:3000"]
     cors_allow_credentials: bool = True
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "DELETE", "PATCH"]
     cors_allow_headers: list[str] = ["*"]
 
-    # JWT Authentication
-    jwt_secret_key: str = "CHANGE_THIS_JWT_SECRET_IN_PRODUCTION"
+    # JWT Authentication (Sprint 2 - Critical Vulnerability Fix #3)
+    jwt_secret_key: str = "dev_jwt_secret_INSECURE_DO_NOT_USE_IN_PRODUCTION_" + "x" * 32
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
@@ -157,7 +159,10 @@ class Settings(BaseSettings):
     @model_validator(mode='after')
     def validate_production_secrets(self):
         """
-        Validate that production secrets have been changed from defaults
+        ENHANCED Sprint 2 Security: Validate production secrets
+
+        Ensures all sensitive configuration values are properly set in production
+        with strong, randomly-generated values.
 
         Raises:
             ValueError: If production environment has weak/default secrets
@@ -165,30 +170,44 @@ class Settings(BaseSettings):
         if self.environment == 'production':
             errors = []
 
+            # Sprint 2 Enhancement: Comprehensive weak secret detection
+            weak_patterns = [
+                'CHANGE_THIS', 'changeme', 'INSECURE', 'DO_NOT_USE',
+                'dev_', 'test_', 'default', 'password', 'secret',
+                '123456', 'admin', 'root', 'qwerty'
+            ]
+
             # Check SECRET_KEY
-            if 'CHANGE_THIS' in self.secret_key or len(self.secret_key) < 32:
+            if any(pattern in self.secret_key for pattern in weak_patterns) or len(self.secret_key) < 64:
                 errors.append(
-                    "SECRET_KEY must be set with a strong random value (min 32 chars) in production. "
+                    "SECRET_KEY must be set with a cryptographically strong random value (min 64 chars) in production. "
                     "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
                 )
 
             # Check JWT_SECRET_KEY
-            if 'CHANGE_THIS' in self.jwt_secret_key or len(self.jwt_secret_key) < 32:
+            if any(pattern in self.jwt_secret_key for pattern in weak_patterns) or len(self.jwt_secret_key) < 64:
                 errors.append(
-                    "JWT_SECRET_KEY must be set with a strong random value (min 32 chars) in production. "
+                    "JWT_SECRET_KEY must be set with a cryptographically strong random value (min 64 chars) in production. "
                     "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
                 )
 
             # Check database password
-            if self.postgres_password in ['easm_dev_password', 'password', '123456', 'admin']:
+            if any(pattern in self.postgres_password.lower() for pattern in weak_patterns) or len(self.postgres_password) < 16:
                 errors.append(
-                    "POSTGRES_PASSWORD must be set with a strong password in production"
+                    "POSTGRES_PASSWORD must be set with a strong password (min 16 chars) in production. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
                 )
 
             # Check MinIO credentials
-            if self.minio_access_key == 'minioadmin' or self.minio_secret_key == 'minioadmin':
+            if any(pattern in self.minio_access_key.lower() for pattern in weak_patterns):
                 errors.append(
-                    "MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be changed from defaults in production"
+                    "MINIO_ACCESS_KEY must be changed from defaults in production"
+                )
+
+            if any(pattern in self.minio_secret_key.lower() for pattern in weak_patterns) or len(self.minio_secret_key) < 32:
+                errors.append(
+                    "MINIO_SECRET_KEY must be set with a strong random value (min 32 chars) in production. "
+                    "Generate with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
                 )
 
             # Check CORS configuration
@@ -196,6 +215,12 @@ class Settings(BaseSettings):
                 errors.append(
                     "CORS_ORIGINS must not include wildcard ('*') in production. "
                     "Specify exact allowed origins."
+                )
+
+            # Check that Redis password is set in production
+            if not self.redis_password:
+                errors.append(
+                    "REDIS_PASSWORD must be set in production to secure Redis access"
                 )
 
             if errors:

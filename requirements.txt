@@ -44,6 +44,8 @@ coverage[toml]==7.4.0
 
 # Utilities
 python-dateutil==2.8.2
+tldextract==5.1.1  # Domain validation (Sprint 2 security fix)
+cryptography==41.0.7  # Secret encryption (Sprint 2 security fix)
 
 # Monitoring and Error Tracking
 sentry-sdk[celery,sqlalchemy]==1.40.0
