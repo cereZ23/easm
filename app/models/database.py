@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Enum, Float, Boolean, Index
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Enum, Float, Boolean, Index, JSON
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 import enum
@@ -46,16 +46,31 @@ class Asset(Base):
     is_active = Column(Boolean, default=True)
     raw_metadata = Column(Text)  # JSON field for flexible attrs
 
+    # Sprint 2: Enrichment tracking
+    last_enriched_at = Column(DateTime)
+    enrichment_status = Column(String(50), default='pending')  # pending, enriched, failed
+
+    # Sprint 2: Tiered enrichment - Priority-based scheduling
+    priority = Column(String(20), default='normal')  # critical, high, normal, low
+    priority_updated_at = Column(DateTime)
+    priority_auto_calculated = Column(Boolean, default=True)  # False if manually set
+
     tenant = relationship("Tenant", back_populates="assets")
     services = relationship("Service", back_populates="asset", cascade="all, delete-orphan")
     findings = relationship("Finding", back_populates="asset", cascade="all, delete-orphan")
     events = relationship("Event", back_populates="asset", cascade="all, delete-orphan")
+
+    # Sprint 2: New enrichment relationships
+    certificates = relationship("Certificate", back_populates="asset", cascade="all, delete-orphan")
+    endpoints = relationship("Endpoint", back_populates="asset", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index('idx_tenant_type', 'tenant_id', 'type'),
         Index('idx_identifier', 'identifier'),
         Index('idx_tenant_identifier', 'tenant_id', 'identifier'),
         Index('idx_unique_asset', 'tenant_id', 'identifier', 'type', unique=True),  # For bulk upsert
+        Index('idx_asset_priority_enrichment', 'tenant_id', 'priority', 'last_enriched_at'),  # Sprint 2
+        Index('idx_enrichment_status', 'enrichment_status'),  # Sprint 2
     )
 
     def __repr__(self):
@@ -78,10 +93,29 @@ class Service(Base):
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
 
+    # Sprint 2: HTTPx enrichment fields
+    web_server = Column(String(200))      # nginx, Apache, IIS
+    http_technologies = Column(JSON)      # ["PHP", "WordPress", "jQuery"]
+    http_headers = Column(JSON)           # Full response headers
+    response_time_ms = Column(Integer)    # Response time in milliseconds
+    content_length = Column(Integer)      # Content length in bytes
+    redirect_url = Column(String(2048))   # Final URL after redirects
+    screenshot_url = Column(String(500))  # MinIO URL to screenshot (optional)
+
+    # Sprint 2: TLSx enrichment fields
+    has_tls = Column(Boolean, default=False)
+    tls_version = Column(String(50))      # TLSv1.3, TLSv1.2
+
+    # Sprint 2: Enrichment tracking
+    enriched_at = Column(DateTime)        # Last enrichment timestamp
+    enrichment_source = Column(String(50)) # httpx, naabu, tlsx
+
     asset = relationship("Asset", back_populates="services")
 
     __table_args__ = (
         Index('idx_asset_port', 'asset_id', 'port'),
+        Index('idx_enrichment_source', 'enrichment_source'),  # Sprint 2
+        Index('idx_has_tls', 'has_tls'),  # Sprint 2
     )
 
     def __repr__(self):

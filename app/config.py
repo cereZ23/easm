@@ -134,6 +134,32 @@ class Settings(BaseSettings):
     discovery_naabu_timeout: int = 1200
     discovery_nuclei_timeout: int = 1800
 
+    # Enrichment Pipeline (Sprint 2)
+    enrichment_enabled: bool = True
+    enrichment_auto_trigger: bool = True  # Automatically trigger enrichment after discovery
+    enrichment_batch_size: int = 100  # Max assets to enrich per run
+
+    # HTTPx - Web Technology Fingerprinting
+    httpx_timeout: int = 900  # 15 minutes
+    httpx_rate_limit: int = 50  # Requests per second
+    httpx_response_size_limit: int = 1048576  # 1MB max response size
+
+    # Naabu - Port Scanning
+    naabu_timeout: int = 1200  # 20 minutes
+    naabu_rate_limit: int = 1000  # Packets per second
+    naabu_default_ports: str = "top-1000"  # top-100, top-1000, or "1-65535"
+    naabu_blocked_ports: list[int] = [22, 445, 3389, 3306, 5432]  # SSH, SMB, RDP, MySQL, PostgreSQL
+
+    # TLSx - TLS/SSL Certificate Analysis
+    tlsx_timeout: int = 600  # 10 minutes
+    tlsx_expiry_warning_days: int = 30  # Alert if cert expires within N days
+
+    # Katana - Web Crawling
+    katana_timeout: int = 1800  # 30 minutes
+    katana_max_depth: int = 3  # Maximum crawl depth
+    katana_max_pages: int = 1000  # Maximum pages per domain
+    katana_respect_robots: bool = True  # Respect robots.txt
+
     # Rate Limiting
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 60
