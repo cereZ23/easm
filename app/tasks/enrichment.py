@@ -525,8 +525,11 @@ def sanitize_html(text: str) -> str:
     # Remove javascript: URLs
     text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
 
-    # Remove event handlers (onclick, onerror, etc.)
-    text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
+    # Remove event handlers (onclick, onerror, etc.) with their values
+    # Matches: on<event>="value" or on<event>='value'
+    text = re.sub(r'on\w+\s*=\s*["\'][^"\']*["\']', '', text, flags=re.IGNORECASE)
+    # Also handle unquoted values: on<event>=value
+    text = re.sub(r'on\w+\s*=\s*\S+', '', text, flags=re.IGNORECASE)
 
     return text.strip()
 

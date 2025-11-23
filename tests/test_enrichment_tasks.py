@@ -284,9 +284,13 @@ class TestHTTPx:
         # Safe content should be preserved
         assert 'Safe content here' in sanitized
 
+    @patch('app.database.SessionLocal')
     @patch('app.tasks.enrichment.SecureToolExecutor')
-    def test_run_httpx_with_domain_assets(self, mock_executor_class, db_session, mock_tenant, mock_assets):
+    def test_run_httpx_with_domain_assets(self, mock_executor_class, mock_session_local, db_session, mock_tenant, mock_assets):
         """Test HTTPx execution with domain assets"""
+        # Patch SessionLocal to return our test session
+        mock_session_local.return_value = db_session
+
         # Setup mock executor
         mock_executor = MagicMock()
         mock_executor_class.return_value.__enter__.return_value = mock_executor
@@ -504,8 +508,12 @@ class TestTLSx:
 class TestSecurityValidation:
     """Test security validation and SSRF prevention"""
 
-    def test_httpx_validates_urls(self, db_session, mock_tenant):
+    @patch('app.database.SessionLocal')
+    def test_httpx_validates_urls(self, mock_session_local, db_session, mock_tenant):
         """Test that HTTPx validates URLs before execution"""
+        # Patch SessionLocal to return our test session
+        mock_session_local.return_value = db_session
+
         # Create asset with internal IP (should be rejected by URLValidator)
         internal_asset = Asset(
             tenant_id=mock_tenant.id,
@@ -525,8 +533,12 @@ class TestSecurityValidation:
             # Should return 0 services because IP was rejected
             assert result.get('services_enriched', 0) == 0
 
-    def test_naabu_validates_ips(self, db_session, mock_tenant):
+    @patch('app.database.SessionLocal')
+    def test_naabu_validates_ips(self, mock_session_local, db_session, mock_tenant):
         """Test that Naabu validates IPs before scanning"""
+        # Patch SessionLocal to return our test session
+        mock_session_local.return_value = db_session
+
         # Create asset with loopback IP (should be rejected)
         loopback_asset = Asset(
             tenant_id=mock_tenant.id,
@@ -554,10 +566,14 @@ class TestSecurityValidation:
 class TestEnrichmentIntegration:
     """Test end-to-end enrichment workflows"""
 
+    @patch('app.database.SessionLocal')
     @patch('app.tasks.enrichment.chain')
     @patch('app.tasks.enrichment.group')
-    def test_run_enrichment_pipeline_orchestration(self, mock_group, mock_chain, db_session, mock_tenant, mock_assets):
+    def test_run_enrichment_pipeline_orchestration(self, mock_group, mock_chain, mock_session_local, db_session, mock_tenant, mock_assets):
         """Test that enrichment pipeline orchestrates tools correctly"""
+        # Patch SessionLocal to return our test session
+        mock_session_local.return_value = db_session
+
         # Set assets as stale
         for asset in mock_assets:
             asset.last_enriched_at = datetime.utcnow() - timedelta(days=10)
@@ -641,12 +657,17 @@ class TestEnrichmentPerformance:
 class TestErrorHandling:
     """Test error handling in enrichment tasks"""
 
+    @patch('app.database.SessionLocal')
     @patch('app.tasks.enrichment.SecureToolExecutor')
-    def test_httpx_handles_tool_execution_error(self, mock_executor_class, db_session, mock_tenant, mock_assets):
+    def test_httpx_handles_tool_execution_error(self, mock_executor_class, mock_session_local, db_session, mock_tenant, mock_assets):
         """Test that HTTPx handles tool execution errors gracefully"""
+        # Patch SessionLocal to return our test session
+        mock_session_local.return_value = db_session
+
         # Setup mock executor to raise exception
         mock_executor = MagicMock()
         mock_executor_class.return_value.__enter__.return_value = mock_executor
+        mock_executor.create_input_file.return_value = "/tmp/urls.txt"
 
         from app.utils.secure_executor import ToolExecutionError
         mock_executor.execute.side_effect = ToolExecutionError("Tool failed")

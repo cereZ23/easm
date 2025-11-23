@@ -136,7 +136,7 @@ class APIKey(Base):
 
     # Relationships
     user = relationship("User", back_populates="api_keys")
-    tenant = relationship("Tenant", back_populates="api_keys")
+    tenant = relationship("Tenant", back_populates="api_key_objects")
 
     __table_args__ = (
         Index('idx_tenant_active', 'tenant_id', 'is_active'),

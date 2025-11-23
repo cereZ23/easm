@@ -12,9 +12,16 @@ import tempfile
 import os
 from unittest.mock import MagicMock, patch
 from datetime import datetime
+from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
+# Load environment variables from .env file for database connection
+from dotenv import load_dotenv
+env_path = Path(__file__).parent.parent / '.env'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
 
 # Import all models to ensure they're registered with SQLAlchemy
 import app.models
@@ -22,6 +29,7 @@ from app.models import (
     Base, Tenant, Asset, Seed, Event, Service, Finding,
     AssetType, EventKind, FindingSeverity, FindingStatus
 )
+from app.models.enrichment import Certificate, Endpoint
 
 
 # Pytest configuration
@@ -47,20 +55,49 @@ def pytest_configure(config):
 # Database Fixtures
 @pytest.fixture(scope='function')
 def db_engine():
-    """Create in-memory SQLite database engine"""
-    engine = create_engine('sqlite:///:memory:', echo=False)
+    """Create PostgreSQL database engine for testing
+
+    Uses the PostgreSQL database from docker-compose.
+    Tests run in transactions that are rolled back for isolation.
+    """
+    # Use the actual PostgreSQL database from docker-compose
+    # Connection string matches docker-compose.yml configuration
+    # Using 127.0.0.1 instead of localhost to force IPv4
+    # Read password from environment (set in .env file)
+    db_password = os.environ.get('DB_PASSWORD', 'easm_password')
+    database_url = os.environ.get(
+        'TEST_DATABASE_URL',
+        f'postgresql://easm:{db_password}@127.0.0.1:15432/easm'
+    )
+
+    engine = create_engine(database_url, echo=False)
+
+    # Ensure all tables exist
     Base.metadata.create_all(engine)
+
     yield engine
     engine.dispose()
 
 
 @pytest.fixture(scope='function')
 def db_session(db_engine):
-    """Create database session"""
-    SessionLocal = sessionmaker(bind=db_engine)
+    """Create database session with transaction rollback for test isolation"""
+    # Create a connection
+    connection = db_engine.connect()
+
+    # Begin a transaction
+    transaction = connection.begin()
+
+    # Create a session bound to the connection
+    SessionLocal = sessionmaker(bind=connection)
     session = SessionLocal()
+
     yield session
+
+    # Rollback the transaction to undo all changes
     session.close()
+    transaction.rollback()
+    connection.close()
 
 
 @pytest.fixture(scope='function')
@@ -76,8 +113,7 @@ def tenant(db_session):
     tenant = Tenant(
         name="Test Tenant",
         slug="test-tenant",
-        contact_policy="security@test.com",
-        osint_api_keys=None
+        contact_policy="security@test.com"
     )
     db_session.add(tenant)
     db_session.commit()
@@ -91,8 +127,7 @@ def tenant_with_api_keys(db_session):
     tenant = Tenant(
         name="Tenant With Keys",
         slug="tenant-keys",
-        contact_policy="security@test.com",
-        osint_api_keys='{"shodan": "test_key", "censys": "test_key"}'
+        contact_policy="security@test.com"
     )
     db_session.add(tenant)
     db_session.commit()
@@ -522,6 +557,104 @@ def test_config():
         'max_retries': 3,
         'memory_limit': 1024 * 1024 * 1024,  # 1GB
     }
+
+
+# Enrichment-specific Fixtures
+@pytest.fixture
+def mock_tenant(db_session):
+    """Create a test tenant for enrichment tests"""
+    tenant = Tenant(
+        name="Mock Tenant",
+        slug="mock-tenant",
+        contact_policy="security@mock.com"
+    )
+    db_session.add(tenant)
+    db_session.commit()
+    db_session.refresh(tenant)
+    return tenant
+
+
+@pytest.fixture
+def mock_asset(db_session, mock_tenant):
+    """Create a mock asset for enrichment tests"""
+    asset = Asset(
+        tenant_id=mock_tenant.id,
+        identifier="test.example.com",
+        type=AssetType.SUBDOMAIN,
+        risk_score=5.0,
+        is_active=True,
+        priority='normal',
+        enrichment_status='pending'
+    )
+    db_session.add(asset)
+    db_session.commit()
+    db_session.refresh(asset)
+    return asset
+
+
+@pytest.fixture
+def mock_assets(db_session, mock_tenant):
+    """Create multiple mock assets with different priorities"""
+    from datetime import datetime, timedelta
+
+    assets = [
+        Asset(
+            tenant_id=mock_tenant.id,
+            identifier="critical.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=9.0,
+            is_active=True,
+            priority='critical',
+            enrichment_status='pending',
+            last_enriched_at=None
+        ),
+        Asset(
+            tenant_id=mock_tenant.id,
+            identifier="high.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=7.0,
+            is_active=True,
+            priority='high',
+            enrichment_status='pending',
+            last_enriched_at=None
+        ),
+        Asset(
+            tenant_id=mock_tenant.id,
+            identifier="normal.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=5.0,
+            is_active=True,
+            priority='normal',
+            enrichment_status='pending',
+            last_enriched_at=None
+        ),
+        Asset(
+            tenant_id=mock_tenant.id,
+            identifier="low.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=2.0,
+            is_active=True,
+            priority='low',
+            enrichment_status='pending',
+            last_enriched_at=None
+        ),
+    ]
+    db_session.add_all(assets)
+    db_session.commit()
+    for a in assets:
+        db_session.refresh(a)
+    return assets
+
+
+@pytest.fixture
+def mock_tenant_logger():
+    """Mock tenant logger for security logging"""
+    logger = MagicMock()
+    logger.info = MagicMock()
+    logger.warning = MagicMock()
+    logger.error = MagicMock()
+    logger.critical = MagicMock()
+    return logger
 
 
 # Mark slow tests

@@ -12,14 +12,14 @@ class Tenant(Base):
     name = Column(String(255), nullable=False)
     slug = Column(String(100), unique=True, nullable=False)
     contact_policy = Column(Text)
-    osint_api_keys = Column(Text)  # JSON encrypted field for OSINT providers
+    api_keys = Column(Text)  # JSON encrypted field for OSINT/API providers (text column)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     assets = relationship("Asset", back_populates="tenant", cascade="all, delete-orphan")
     seeds = relationship("Seed", back_populates="tenant", cascade="all, delete-orphan")
     memberships = relationship("TenantMembership", back_populates="tenant", cascade="all, delete-orphan")
-    api_keys = relationship("APIKey", back_populates="tenant", cascade="all, delete-orphan")
+    api_key_objects = relationship("APIKey", back_populates="tenant", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Tenant(id={self.id}, name='{self.name}', slug='{self.slug}')>"
