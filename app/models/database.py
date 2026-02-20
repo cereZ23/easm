@@ -61,8 +61,9 @@ class Asset(Base):
     events = relationship("Event", back_populates="asset", cascade="all, delete-orphan")
 
     # Sprint 2: New enrichment relationships
-    certificates = relationship("Certificate", back_populates="asset", cascade="all, delete-orphan")
-    endpoints = relationship("Endpoint", back_populates="asset", cascade="all, delete-orphan")
+    # TODO: Re-enable after fixing circular import
+    # certificates = relationship("Certificate", back_populates="asset", cascade="all, delete-orphan")
+    # endpoints = relationship("Endpoint", back_populates="asset", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index('idx_tenant_type', 'tenant_id', 'type'),
@@ -147,10 +148,15 @@ class Finding(Base):
     severity = Column(Enum(FindingSeverity), nullable=False)
     cvss_score = Column(Float)
     cve_id = Column(String(50))
-    evidence = Column(Text)  # JSON
+    evidence = Column(JSON)
     first_seen = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
     status = Column(Enum(FindingStatus), default=FindingStatus.OPEN)
+
+    # Sprint 3: Nuclei integration - Additional metadata
+    matched_at = Column(String(2048))  # URL where finding was discovered
+    host = Column(String(500))  # Hostname extracted from matched_at
+    matcher_name = Column(String(255))  # Nuclei matcher name for deduplication
 
     asset = relationship("Asset", back_populates="findings")
 
@@ -158,6 +164,10 @@ class Finding(Base):
         Index('idx_asset_severity', 'asset_id', 'severity'),
         Index('idx_status', 'status'),
         Index('idx_severity_status', 'severity', 'status'),
+        Index('idx_template_id', 'template_id'),
+        Index('idx_cve_id', 'cve_id'),
+        # Sprint 3: Deduplication index (asset_id, template_id, matcher_name)
+        Index('idx_finding_dedup', 'asset_id', 'template_id', 'matcher_name'),
     )
 
     def __repr__(self):
@@ -210,3 +220,35 @@ class Seed(Base):
 
     def __repr__(self):
         return f"<Seed(id={self.id}, type='{self.type}', value='{self.value}')>"
+
+
+class Suppression(Base):
+    """
+    Suppression rules for filtering false positive findings
+
+    Sprint 3: Nuclei integration - False positive management
+    """
+    __tablename__ = 'suppressions'
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey('tenants.id'), nullable=True)  # NULL for global
+    name = Column(String(255), nullable=False)
+    pattern_type = Column(String(50), nullable=False)  # template_id, url, host, severity, name
+    pattern = Column(String(1000), nullable=False)  # Regex pattern
+    reason = Column(Text)  # Why this is suppressed
+    is_active = Column(Boolean, default=True)
+    is_global = Column(Boolean, default=False)  # Applies to all tenants
+    priority = Column(Integer, default=0)  # Higher priority rules matched first
+    expires_at = Column(DateTime)  # Optional expiration
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index('idx_suppression_tenant', 'tenant_id'),
+        Index('idx_suppression_active', 'is_active'),
+        Index('idx_suppression_pattern_type', 'pattern_type'),
+        Index('idx_suppression_global', 'is_global'),
+    )
+
+    def __repr__(self):
+        return f"<Suppression(id={self.id}, name='{self.name}', pattern_type='{self.pattern_type}')>"

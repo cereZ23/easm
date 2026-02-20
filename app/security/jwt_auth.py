@@ -2,10 +2,16 @@
 JWT authentication and authorization
 
 Production-grade JWT implementation with:
+- RS256/HS256 token signing (asymmetric/symmetric)
 - Token creation and validation
 - Token revocation support
 - Refresh token mechanism
 - Role-based access control (RBAC)
+
+Security Enhancement (Sprint 3):
+- Integrated RS256 support from app.core.security
+- Automatic RSA key generation
+- Fallback to HS256 for development
 """
 
 from datetime import datetime, timedelta
@@ -14,12 +20,14 @@ import secrets
 import logging
 
 import jwt
+from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
 from fastapi import HTTPException, Security, Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 import redis
 
 from app.config import settings
+from app.core.security import SecurityKeys  # Import RSA key support
 
 logger = logging.getLogger(__name__)
 
@@ -29,28 +37,44 @@ class JWTManager:
     Production-grade JWT authentication manager
 
     Features:
+    - RS256 (asymmetric) or HS256 (symmetric) token signing
+    - Automatic RSA key generation and management
     - Secure token generation with rotation
     - Token revocation via Redis
     - Refresh token support
     - Role and permission validation
+
+    Security:
+    - Uses RS256 by default for production (private key for signing, public for verification)
+    - Falls back to HS256 for development if RSA keys unavailable
+    - Supports token revocation via Redis whitelist
     """
 
     def __init__(
         self,
         secret_key: Optional[str] = None,
-        algorithm: str = "HS256",
+        algorithm: Optional[str] = None,
         redis_client: Optional[redis.Redis] = None
     ):
         """
-        Initialize JWT manager
+        Initialize JWT manager with RS256/HS256 support
 
         Args:
-            secret_key: Secret key for JWT signing (uses settings if not provided)
-            algorithm: JWT signing algorithm
+            secret_key: Secret key for HS256 (uses settings if not provided)
+            algorithm: JWT signing algorithm (uses settings if not provided)
             redis_client: Redis client for token revocation
+
+        Security:
+        - RS256 recommended for production (asymmetric keys)
+        - HS256 fallback for development (symmetric secret)
         """
+        # Initialize security keys (RS256 or HS256)
+        self.security_keys = SecurityKeys()
+        self.algorithm = algorithm or self.security_keys.algorithm
+
+        # Legacy secret key support (for HS256 fallback)
         self.secret_key = secret_key or settings.jwt_secret_key
-        self.algorithm = algorithm
+
         self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
         # Redis for token revocation
@@ -131,13 +155,14 @@ class JWTManager:
         if additional_claims:
             payload.update(additional_claims)
 
-        # Encode token
-        token = jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+        # Encode token with appropriate key (RS256 or HS256)
+        signing_key = self.security_keys.get_signing_key()
+        token = jwt.encode(payload, signing_key, algorithm=self.algorithm)
 
         # Store in Redis for revocation capability
         try:
             self.redis_client.setex(
-                f"jwt:active:{jti}",
+                f"jwt:access:{jti}",
                 int(expires_delta.total_seconds()),
                 subject
             )
@@ -180,7 +205,9 @@ class JWTManager:
             "jti": jti,
         }
 
-        token = jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+        # Encode token with appropriate key (RS256 or HS256)
+        signing_key = self.security_keys.get_signing_key()
+        token = jwt.encode(payload, signing_key, algorithm=self.algorithm)
 
         # Store refresh token in Redis
         try:
@@ -211,10 +238,11 @@ class JWTManager:
         token = credentials.credentials
 
         try:
-            # Decode token
+            # Decode token with appropriate verification key
+            verification_key = self.security_keys.get_verification_key()
             payload = jwt.decode(
                 token,
-                self.secret_key,
+                verification_key,
                 algorithms=[self.algorithm]
             )
 
@@ -240,7 +268,7 @@ class JWTManager:
                 status_code=401,
                 detail="Token has expired"
             )
-        except jwt.JWTError as e:
+        except InvalidTokenError as e:
             logger.warning(f"Invalid token: {e}")
             raise HTTPException(
                 status_code=401,
@@ -283,10 +311,11 @@ class JWTManager:
             Dict with new access and refresh tokens
         """
         try:
-            # Decode refresh token
+            # Decode refresh token with appropriate verification key
+            verification_key = self.security_keys.get_verification_key()
             payload = jwt.decode(
                 refresh_token,
-                self.secret_key,
+                verification_key,
                 algorithms=[self.algorithm]
             )
 
@@ -333,7 +362,7 @@ class JWTManager:
                 status_code=401,
                 detail="Refresh token has expired"
             )
-        except jwt.JWTError:
+        except InvalidTokenError:
             raise HTTPException(
                 status_code=401,
                 detail="Invalid refresh token"

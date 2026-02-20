@@ -39,14 +39,18 @@ class Settings(BaseSettings):
     # Development fallback values provided for local testing only
     secret_key: str = "dev_secret_key_INSECURE_DO_NOT_USE_IN_PRODUCTION_" + "x" * 32
     api_key_header: str = "X-API-Key"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:13000"]
     cors_allow_credentials: bool = True
     cors_allow_methods: list[str] = ["GET", "POST", "PUT", "DELETE", "PATCH"]
     cors_allow_headers: list[str] = ["*"]
 
-    # JWT Authentication (Sprint 2 - Critical Vulnerability Fix #3)
+    # JWT Authentication (Sprint 2 - Critical Vulnerability Fix #3, Sprint 3 - Enhanced RS256)
+    # RS256 (asymmetric) recommended for production - more secure, allows public key distribution
+    # HS256 (symmetric) fallback for development - simpler setup, requires shared secret
     jwt_secret_key: str = "dev_jwt_secret_INSECURE_DO_NOT_USE_IN_PRODUCTION_" + "x" * 32
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: str = "RS256"  # RS256 (asymmetric) for production, HS256 (symmetric) for dev
+    jwt_private_key_path: Optional[str] = None  # Path to RS256 private key (PEM format)
+    jwt_public_key_path: Optional[str] = None   # Path to RS256 public key (PEM format)
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
 

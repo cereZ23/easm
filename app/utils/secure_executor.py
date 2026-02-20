@@ -36,7 +36,7 @@ class SecureToolExecutor:
     # Default resource limits
     DEFAULT_TIMEOUT = 300  # 5 minutes
     DEFAULT_CPU_LIMIT = 600  # 10 minutes CPU time
-    DEFAULT_MEMORY_LIMIT = 2 * 1024 * 1024 * 1024  # 2GB
+    DEFAULT_MEMORY_LIMIT = 8 * 1024 * 1024 * 1024  # 8GB (increased for Nuclei)
     DEFAULT_FILE_SIZE_LIMIT = 100 * 1024 * 1024  # 100MB
 
     def __init__(self, tenant_id: int):
@@ -147,7 +147,8 @@ class SecureToolExecutor:
         tool: str,
         args: List[str],
         timeout: Optional[int] = None,
-        capture_output: bool = True
+        capture_output: bool = True,
+        stdin_data: Optional[str] = None
     ) -> Tuple[int, str, str]:
         """
         Execute tool with security controls
@@ -157,6 +158,7 @@ class SecureToolExecutor:
             args: Command arguments
             timeout: Execution timeout in seconds
             capture_output: Whether to capture stdout/stderr
+            stdin_data: Optional data to pass to stdin
 
         Returns:
             Tuple of (return_code, stdout, stderr)
@@ -173,9 +175,9 @@ class SecureToolExecutor:
         # Build command
         cmd = [tool] + safe_args
 
-        # Restricted environment
+        # Restricted environment (include /usr/local/pd-tools for ProjectDiscovery tools)
         env = {
-            'PATH': '/usr/local/bin:/usr/bin:/bin',
+            'PATH': '/usr/local/pd-tools:/usr/local/bin:/usr/bin:/bin',
             'HOME': str(self.temp_dir) if self.temp_dir else '/tmp',
             'LANG': 'C.UTF-8',
         }
@@ -193,6 +195,7 @@ class SecureToolExecutor:
 
             result = subprocess.run(
                 cmd,
+                input=stdin_data,  # Pass stdin data if provided
                 capture_output=capture_output,
                 text=True,
                 timeout=timeout,

@@ -20,10 +20,9 @@ celery = Celery(
     backend=settings.celery_backend,
     include=[
         'app.tasks.discovery',
-        # Future tasks modules will be added in later sprints
-        # 'app.tasks.enrichment',
-        # 'app.tasks.scanning',
-        # 'app.tasks.alerting'
+        'app.tasks.enrichment',
+        'app.tasks.scanning',
+        # 'app.tasks.alerting'  # Not yet implemented
     ]
 )
 

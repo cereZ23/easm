@@ -107,7 +107,8 @@ class TenantMembership(Base):
         role_permissions = {
             'viewer': ['read'],
             'member': ['read', 'write'],
-            'admin': ['read', 'write', 'admin']
+            'admin': ['read', 'write', 'admin'],
+            'owner': ['read', 'write', 'admin']  # Owner has all permissions
         }
         return permission in role_permissions.get(self.role, [])
 

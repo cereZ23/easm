@@ -24,10 +24,11 @@ ENV PATH="${GOPATH}/bin:/usr/local/pd-tools:${PATH}"
 
 # Install ProjectDiscovery tools using `go install` (works for all architectures)
 # Install AFTER pip to ensure PD tools override any Python CLI conflicts (like httpx)
+# NOTE: HTTPx v1.7.x has OOM issues with wappalyzergo, using v1.6.8 instead
 RUN mkdir -p /usr/local/pd-tools && \
     go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
     go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest && \
-    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
+    go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.6.8 && \
     go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \
     go install -v github.com/projectdiscovery/katana/cmd/katana@latest && \
     go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \

@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 def get_minio_client():
     """Get MinIO client instance"""
     return Minio(
-        os.getenv('MINIO_ENDPOINT', 'localhost:9000'),
-        access_key=os.getenv('MINIO_USER', 'minioadmin'),
-        secret_key=os.getenv('MINIO_PASSWORD', 'minioadmin123'),
+        os.getenv('MINIO_ENDPOINT', 'minio:9000'),
+        access_key=os.getenv('MINIO_ROOT_USER', os.getenv('MINIO_USER', 'minioadmin')),
+        secret_key=os.getenv('MINIO_ROOT_PASSWORD', os.getenv('MINIO_PASSWORD', 'minioadmin123')),
         secure=False  # Set to True if using HTTPS
     )
 
@@ -36,26 +36,26 @@ def store_raw_output(tenant_id: int, tool: str, data: any):
         tool: Tool name (subfinder, dnsx, httpx, etc.)
         data: Data to store (will be JSON serialized)
     """
-    client = get_minio_client()
-    bucket_name = f'tenant-{tenant_id}'
-
-    # Ensure bucket exists
-    ensure_bucket_exists(client, bucket_name)
-
-    # Generate object name with timestamp
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    object_name = f'{tool}/{timestamp}.json'
-
-    # Convert data to JSON bytes
-    if isinstance(data, (list, dict)):
-        json_str = json.dumps(data, indent=2, default=str)
-    else:
-        json_str = json.dumps({'data': data}, default=str)
-
-    data_bytes = json_str.encode('utf-8')
-
-    # Upload to MinIO
     try:
+        client = get_minio_client()
+        bucket_name = f'tenant-{tenant_id}'
+
+        # Ensure bucket exists
+        ensure_bucket_exists(client, bucket_name)
+
+        # Generate object name with timestamp
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        object_name = f'{tool}/{timestamp}.json'
+
+        # Convert data to JSON bytes
+        if isinstance(data, (list, dict)):
+            json_str = json.dumps(data, indent=2, default=str)
+        else:
+            json_str = json.dumps({'data': data}, default=str)
+
+        data_bytes = json_str.encode('utf-8')
+
+        # Upload to MinIO
         client.put_object(
             bucket_name,
             object_name,
@@ -65,9 +65,10 @@ def store_raw_output(tenant_id: int, tool: str, data: any):
         )
         logger.info(f"Stored {tool} output to {bucket_name}/{object_name}")
         return object_name
-    except S3Error as e:
-        logger.error(f"Error storing output: {e}", exc_info=True)
-        raise
+    except (S3Error, Exception) as e:
+        # Log but don't fail - MinIO is optional
+        logger.warning(f"MinIO storage failed (non-critical): {e}")
+        return None
 
 def retrieve_raw_output(tenant_id: int, object_name: str):
     """

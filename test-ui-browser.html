@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EASM UI Browser Test</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 { margin-bottom: 10px; }
+        .header p { opacity: 0.9; }
+        .content { padding: 30px; }
+        .test-box {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            border-left: 4px solid #667eea;
+        }
+        .test-box.success { border-left-color: #10b981; background: #f0fdf4; }
+        .test-box.error { border-left-color: #ef4444; background: #fef2f2; }
+        .test-box h3 {
+            margin-bottom: 15px;
+            color: #1f2937;
+        }
+        .button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin: 5px;
+        }
+        .button:hover { background: #5a67d8; transform: translateY(-1px); }
+        .button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .button-group { text-align: center; margin: 20px 0; }
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            margin: 5px 0;
+        }
+        .status.pass { background: #d1fae5; color: #065f46; }
+        .status.fail { background: #fee2e2; color: #991b1b; }
+        .status.pending { background: #e0e7ff; color: #3730a3; }
+        pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 13px;
+            margin: 10px 0;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stat-card {
+            background: white;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        .stat-number {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .stat-number.pass { color: #10b981; }
+        .stat-number.fail { color: #ef4444; }
+        .stat-number.total { color: #667eea; }
+        .stat-label {
+            color: #6b7280;
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .iframe-container {
+            margin: 20px 0;
+            border: 3px solid #e5e7eb;
+            border-radius: 8px;
+            overflow: hidden;
+            background: white;
+        }
+        .iframe-header {
+            background: #f3f4f6;
+            padding: 10px 15px;
+            border-bottom: 1px solid #e5e7eb;
+            font-weight: 600;
+            color: #374151;
+        }
+        iframe {
+            width: 100%;
+            height: 600px;
+            border: none;
+            display: block;
+        }
+        .tips {
+            background: #fffbeb;
+            border: 2px solid #fbbf24;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .tips h4 {
+            color: #92400e;
+            margin-bottom: 10px;
+        }
+        .tips ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        .tips li {
+            padding: 5px 0;
+            color: #78350f;
+        }
+        .tips li:before {
+            content: "→ ";
+            font-weight: bold;
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 EASM UI Browser Test</h1>
+            <p>Interactive testing interface for the EASM Platform frontend</p>
+        </div>
+
+        <div class="content">
+            <!-- Stats -->
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-number pass" id="pass-count">0</div>
+                    <div class="stat-label">Passed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number fail" id="fail-count">0</div>
+                    <div class="stat-label">Failed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number total" id="total-count">0</div>
+                    <div class="stat-label">Total</div>
+                </div>
+            </div>
+
+            <!-- Control Buttons -->
+            <div class="button-group">
+                <button class="button" onclick="runQuickTest()">🔍 Quick Test (API Only)</button>
+                <button class="button" onclick="openLoginPage()">🔐 Open Login Page</button>
+                <button class="button" onclick="openDashboard()">📊 Open Dashboard</button>
+                <button class="button" onclick="clearResults()">🗑️ Clear Results</button>
+            </div>
+
+            <!-- Tips -->
+            <div class="tips">
+                <h4>💡 Testing Tips</h4>
+                <ul>
+                    <li>Run "Quick Test" first to check API connectivity</li>
+                    <li>Use "Open Login Page" to test in iframe below</li>
+                    <li>If iframe is blank, open links in new tab</li>
+                    <li>Check browser console (F12) for errors</li>
+                    <li>Try incognito mode if issues persist</li>
+                </ul>
+            </div>
+
+            <!-- Results -->
+            <div id="results"></div>
+
+            <!-- Embedded UI Test -->
+            <div class="iframe-container" id="iframe-container" style="display: none;">
+                <div class="iframe-header">
+                    <span id="iframe-title">EASM UI</span>
+                    <button class="button" style="float: right; padding: 5px 15px; font-size: 14px;" onclick="openInNewTab()">
+                        Open in New Tab →
+                    </button>
+                </div>
+                <iframe id="ui-frame" src="about:blank"></iframe>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:18000';
+        const UI_BASE = 'http://localhost:13000';
+        let currentUrl = '';
+
+        const stats = { pass: 0, fail: 0, total: 0 };
+
+        function updateStats() {
+            document.getElementById('pass-count').textContent = stats.pass;
+            document.getElementById('fail-count').textContent = stats.fail;
+            document.getElementById('total-count').textContent = stats.total;
+        }
+
+        function addResult(name, passed, details) {
+            stats.total++;
+            if (passed) {
+                stats.pass++;
+            } else {
+                stats.fail++;
+            }
+            updateStats();
+
+            const resultDiv = document.createElement('div');
+            resultDiv.className = `test-box ${passed ? 'success' : 'error'}`;
+            resultDiv.innerHTML = `
+                <h3>
+                    ${passed ? '✅' : '❌'} ${name}
+                    <span class="status ${passed ? 'pass' : 'fail'}">
+                        ${passed ? 'PASS' : 'FAIL'}
+                    </span>
+                </h3>
+                ${details ? `<pre>${JSON.stringify(details, null, 2)}</pre>` : ''}
+            `;
+            document.getElementById('results').appendChild(resultDiv);
+        }
+
+        async function runQuickTest() {
+            clearResults();
+
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'test-box';
+            resultDiv.innerHTML = '<h3>🔄 Running tests...</h3>';
+            document.getElementById('results').appendChild(resultDiv);
+
+            // Test 1: API Root
+            try {
+                const response = await fetch(`${API_BASE}/`);
+                const data = await response.json();
+                addResult('API Root Endpoint', response.ok, data);
+            } catch (error) {
+                addResult('API Root Endpoint', false, { error: error.message });
+                return;
+            }
+
+            // Test 2: Login
+            try {
+                const response = await fetch(`${API_BASE}/api/v1/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: 'admin@example.com',
+                        password: 'admin123'
+                    })
+                });
+                const data = await response.json();
+                const passed = response.ok && data.access_token;
+                addResult('Authentication', passed, {
+                    status: response.status,
+                    hasToken: !!data.access_token,
+                    user: data.user?.email
+                });
+
+                if (passed) {
+                    window.TEST_TOKEN = data.access_token;
+
+                    // Test 3: /me endpoint
+                    try {
+                        const meResponse = await fetch(`${API_BASE}/api/v1/auth/me`, {
+                            headers: { 'Authorization': `Bearer ${data.access_token}` }
+                        });
+                        const meData = await meResponse.json();
+                        addResult('User Info (/me)', meResponse.ok, meData);
+                    } catch (error) {
+                        addResult('User Info (/me)', false, { error: error.message });
+                    }
+
+                    // Test 4: Tenants
+                    try {
+                        const tenantResponse = await fetch(`${API_BASE}/api/v1/tenants`, {
+                            headers: { 'Authorization': `Bearer ${data.access_token}` }
+                        });
+                        const tenants = await tenantResponse.json();
+                        addResult('Fetch Tenants', tenantResponse.ok && Array.isArray(tenants), {
+                            count: tenants.length,
+                            tenants: tenants.map(t => t.name)
+                        });
+                    } catch (error) {
+                        addResult('Fetch Tenants', false, { error: error.message });
+                    }
+                }
+            } catch (error) {
+                addResult('Authentication', false, { error: error.message });
+            }
+
+            // Test 5: UI Accessibility
+            try {
+                const uiResponse = await fetch(`${UI_BASE}/`);
+                const html = await uiResponse.text();
+                const hasApp = html.includes('id="app"');
+                addResult('UI Accessibility', uiResponse.ok && hasApp, {
+                    status: uiResponse.status,
+                    hasAppElement: hasApp
+                });
+            } catch (error) {
+                addResult('UI Accessibility', false, { error: error.message });
+            }
+
+            resultDiv.remove();
+
+            // Summary
+            const summary = document.createElement('div');
+            summary.className = 'test-box success';
+            summary.innerHTML = `
+                <h3>📊 Test Summary</h3>
+                <p><strong>Passed:</strong> ${stats.pass} / ${stats.total}</p>
+                <p><strong>Success Rate:</strong> ${((stats.pass / stats.total) * 100).toFixed(1)}%</p>
+                ${stats.fail > 0 ? '<p style="color: #991b1b; margin-top: 10px;"><strong>⚠️ Some tests failed. Check details above.</strong></p>' : ''}
+            `;
+            document.getElementById('results').appendChild(summary);
+        }
+
+        function openLoginPage() {
+            currentUrl = `${UI_BASE}/login`;
+            document.getElementById('iframe-title').textContent = 'Login Page';
+            document.getElementById('ui-frame').src = currentUrl;
+            document.getElementById('iframe-container').style.display = 'block';
+        }
+
+        function openDashboard() {
+            currentUrl = `${UI_BASE}/`;
+            document.getElementById('iframe-title').textContent = 'Dashboard';
+            document.getElementById('ui-frame').src = currentUrl;
+            document.getElementById('iframe-container').style.display = 'block';
+        }
+
+        function openInNewTab() {
+            if (currentUrl) {
+                window.open(currentUrl, '_blank');
+            }
+        }
+
+        function clearResults() {
+            document.getElementById('results').innerHTML = '';
+            stats.pass = 0;
+            stats.fail = 0;
+            stats.total = 0;
+            updateStats();
+        }
+
+        // Auto-load info
+        window.onload = function() {
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'test-box';
+            infoDiv.innerHTML = `
+                <h3>ℹ️ System Information</h3>
+                <p><strong>API Base:</strong> <code>${API_BASE}</code></p>
+                <p><strong>UI Base:</strong> <code>${UI_BASE}</code></p>
+                <p><strong>Test Credentials:</strong> admin@example.com / admin123</p>
+                <p><strong>Browser:</strong> ${navigator.userAgent}</p>
+            `;
+            document.getElementById('results').appendChild(infoDiv);
+        };
+    </script>
+</body>
+</html>

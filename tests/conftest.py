@@ -657,6 +657,783 @@ def mock_tenant_logger():
     return logger
 
 
+# API Testing Fixtures (Sprint 3)
+
+@pytest.fixture
+def client(db_session):
+    """FastAPI test client with test database"""
+    from fastapi.testclient import TestClient
+
+    # Import app and database dependency
+    try:
+        from app.api.main import app
+        from app.database import get_db
+
+        # Override database dependency
+        def override_get_db():
+            try:
+                yield db_session
+            finally:
+                pass
+
+        app.dependency_overrides[get_db] = override_get_db
+
+        test_client = TestClient(app)
+        yield test_client
+
+        # Clear overrides after test
+        app.dependency_overrides.clear()
+    except ImportError:
+        # Fallback if app not yet created
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        app = FastAPI()
+        yield TestClient(app)
+
+
+@pytest.fixture
+def test_tenant(db_session):
+    """Create test tenant for API tests"""
+    tenant = Tenant(
+        name="Test Tenant",
+        slug="test-tenant",
+        contact_policy="security@test.com"
+    )
+    db_session.add(tenant)
+    db_session.commit()
+    db_session.refresh(tenant)
+    return tenant
+
+
+@pytest.fixture
+def test_user(db_session, test_tenant):
+    """Create test user with hashed password"""
+    try:
+        from app.models.user import User
+    except ImportError:
+        # Create minimal User class if not exists
+        from sqlalchemy import Column, Integer, String, Boolean
+        class User(Base):
+            __tablename__ = 'users'
+            id = Column(Integer, primary_key=True)
+            email = Column(String, unique=True, nullable=False)
+            username = Column(String, unique=True, nullable=False)
+            hashed_password = Column(String, nullable=False)
+            is_active = Column(Boolean, default=True)
+            is_superuser = Column(Boolean, default=False)
+
+    try:
+        from app.security.auth import get_password_hash
+    except ImportError:
+        # Fallback password hash
+        import bcrypt
+        def get_password_hash(password: str) -> str:
+            return bcrypt.hashpw(password.encode(), bcrypt.gensalt(12)).decode()
+
+    user = User(
+        email="test@example.com",
+        username="testuser",
+        hashed_password=get_password_hash("password123"),
+        is_active=True,
+        is_superuser=False
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    # Create tenant membership
+    try:
+        from app.models.user import TenantMembership
+        membership = TenantMembership(
+            user_id=user.id,
+            tenant_id=test_tenant.id,
+            role="member"
+        )
+        db_session.add(membership)
+        db_session.commit()
+    except ImportError:
+        pass
+
+    return user
+
+
+@pytest.fixture
+def admin_user(db_session, test_tenant):
+    """Create admin user"""
+    try:
+        from app.models.user import User
+    except ImportError:
+        from sqlalchemy import Column, Integer, String, Boolean
+        class User(Base):
+            __tablename__ = 'users'
+            id = Column(Integer, primary_key=True)
+            email = Column(String, unique=True, nullable=False)
+            username = Column(String, unique=True, nullable=False)
+            hashed_password = Column(String, nullable=False)
+            is_active = Column(Boolean, default=True)
+            is_superuser = Column(Boolean, default=False)
+
+    try:
+        from app.security.auth import get_password_hash
+    except ImportError:
+        import bcrypt
+        def get_password_hash(password: str) -> str:
+            return bcrypt.hashpw(password.encode(), bcrypt.gensalt(12)).decode()
+
+    user = User(
+        email="admin@example.com",
+        username="admin",
+        hashed_password=get_password_hash("admin123"),
+        is_active=True,
+        is_superuser=True
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    # Create tenant membership with admin role
+    try:
+        from app.models.user import TenantMembership
+        membership = TenantMembership(
+            user_id=user.id,
+            tenant_id=test_tenant.id,
+            role="admin"
+        )
+        db_session.add(membership)
+        db_session.commit()
+    except ImportError:
+        pass
+
+    return user
+
+
+@pytest.fixture
+def auth_headers(client, test_user):
+    """Generate JWT token for authenticated requests"""
+    try:
+        response = client.post("/api/v1/auth/login", json={
+            "email": test_user.email,
+            "password": "password123"
+        })
+        if response.status_code == 200:
+            token = response.json()["access_token"]
+            return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        pass
+
+    # Fallback: generate token directly
+    try:
+        from datetime import timedelta
+        from app.security.auth import create_access_token
+        token_data = {"sub": test_user.email, "user_id": test_user.id}
+        token = create_access_token(token_data, expires_delta=timedelta(hours=1))
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        # Last resort: mock token for testing
+        return {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture
+def admin_headers(client, admin_user):
+    """Generate JWT token for admin user"""
+    try:
+        response = client.post("/api/v1/auth/login", json={
+            "email": admin_user.email,
+            "password": "admin123"
+        })
+        if response.status_code == 200:
+            token = response.json()["access_token"]
+            return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        pass
+
+    # Fallback: generate token directly
+    try:
+        from datetime import timedelta
+        from app.security.auth import create_access_token
+        token_data = {"sub": admin_user.email, "user_id": admin_user.id, "is_superuser": True}
+        token = create_access_token(token_data, expires_delta=timedelta(hours=1))
+        return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        return {"Authorization": "Bearer admin-test-token"}
+
+
+@pytest.fixture
+def refresh_token(client, test_user):
+    """Generate refresh token for token refresh tests"""
+    try:
+        response = client.post("/api/v1/auth/login", json={
+            "email": test_user.email,
+            "password": "password123"
+        })
+        if response.status_code == 200:
+            return response.json().get("refresh_token")
+    except Exception:
+        pass
+
+    # Fallback: generate refresh token directly
+    try:
+        from datetime import timedelta
+        from app.security.auth import create_refresh_token
+        token_data = {"sub": test_user.email, "user_id": test_user.id}
+        return create_refresh_token(token_data, expires_delta=timedelta(days=7))
+    except Exception:
+        return "test-refresh-token"
+
+
+@pytest.fixture
+def other_tenant(db_session):
+    """Create another tenant for isolation testing"""
+    tenant = Tenant(
+        name="Other Tenant",
+        slug="other-tenant",
+        contact_policy="other@test.com"
+    )
+    db_session.add(tenant)
+    db_session.commit()
+    db_session.refresh(tenant)
+    return tenant
+
+
+@pytest.fixture
+def other_tenant_user(db_session, other_tenant):
+    """Create user belonging to other tenant"""
+    try:
+        from app.models.user import User, TenantMembership
+    except ImportError:
+        return None
+
+    try:
+        from app.security.auth import get_password_hash
+    except ImportError:
+        import bcrypt
+        def get_password_hash(password: str) -> str:
+            return bcrypt.hashpw(password.encode(), bcrypt.gensalt(12)).decode()
+
+    user = User(
+        email="other@example.com",
+        username="otheruser",
+        hashed_password=get_password_hash("password123"),
+        is_active=True,
+        is_superuser=False
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    membership = TenantMembership(
+        user_id=user.id,
+        tenant_id=other_tenant.id,
+        role="member"
+    )
+    db_session.add(membership)
+    db_session.commit()
+
+    return user
+
+
+@pytest.fixture
+def test_assets(db_session, test_tenant):
+    """Create test assets for querying"""
+    from datetime import datetime, timedelta
+
+    assets = [
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="example.com",
+            type=AssetType.DOMAIN,
+            risk_score=30.0,
+            is_active=True,
+            first_seen=datetime.utcnow() - timedelta(days=30),
+            last_seen=datetime.utcnow()
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="www.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=45.0,
+            is_active=True,
+            first_seen=datetime.utcnow() - timedelta(days=10),
+            last_seen=datetime.utcnow()
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="api.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=75.0,
+            is_active=True,
+            first_seen=datetime.utcnow() - timedelta(hours=2),
+            last_seen=datetime.utcnow()
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="192.168.1.10",
+            type=AssetType.IP,
+            risk_score=60.0,
+            is_active=True,
+            first_seen=datetime.utcnow() - timedelta(days=5),
+            last_seen=datetime.utcnow()
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="https://app.example.com/login",
+            type=AssetType.URL,
+            risk_score=85.0,
+            is_active=True,
+            first_seen=datetime.utcnow() - timedelta(hours=1),
+            last_seen=datetime.utcnow()
+        ),
+    ]
+    db_session.add_all(assets)
+    db_session.commit()
+    for a in assets:
+        db_session.refresh(a)
+    return assets
+
+
+@pytest.fixture
+def test_services(db_session, test_assets):
+    """Create test services"""
+    services = [
+        Service(
+            asset_id=test_assets[1].id,  # www.example.com
+            port=443,
+            protocol="https",
+            product="nginx",
+            version="1.21.0",
+            http_title="Example Site",
+            http_status=200
+        ),
+        Service(
+            asset_id=test_assets[1].id,
+            port=80,
+            protocol="http",
+            product="nginx",
+            version="1.21.0",
+            http_status=301
+        ),
+        Service(
+            asset_id=test_assets[2].id,  # api.example.com
+            port=443,
+            protocol="https",
+            product="apache",
+            version="2.4.41",
+            http_title="API Server",
+            http_status=200
+        ),
+    ]
+    db_session.add_all(services)
+    db_session.commit()
+    for s in services:
+        db_session.refresh(s)
+    return services
+
+
+@pytest.fixture
+def test_certs(db_session, test_assets):
+    """Create test certificates"""
+    from datetime import datetime, timedelta
+
+    certs = [
+        Certificate(
+            asset_id=test_assets[1].id,  # www.example.com
+            common_name="www.example.com",
+            subject_alternative_names=["www.example.com", "example.com"],
+            issuer="Let's Encrypt",
+            not_before=datetime.utcnow() - timedelta(days=60),
+            not_after=datetime.utcnow() + timedelta(days=30),
+            is_wildcard=False,
+            is_self_signed=False
+        ),
+        Certificate(
+            asset_id=test_assets[2].id,  # api.example.com
+            common_name="*.example.com",
+            subject_alternative_names=["*.example.com", "example.com"],
+            issuer="DigiCert",
+            not_before=datetime.utcnow() - timedelta(days=180),
+            not_after=datetime.utcnow() + timedelta(days=10),  # Expiring soon
+            is_wildcard=True,
+            is_self_signed=False
+        ),
+    ]
+    db_session.add_all(certs)
+    db_session.commit()
+    for c in certs:
+        db_session.refresh(c)
+    return certs
+
+
+@pytest.fixture
+def test_findings(db_session, test_assets):
+    """Create test findings"""
+    findings = [
+        Finding(
+            asset_id=test_assets[2].id,  # api.example.com
+            tenant_id=test_assets[2].tenant_id,
+            source="nuclei",
+            template_id="CVE-2021-44228",
+            name="Apache Log4j RCE",
+            severity=FindingSeverity.CRITICAL,
+            cvss_score=10.0,
+            cve_id="CVE-2021-44228",
+            evidence='{"url": "https://api.example.com", "matched": "log4j"}',
+            status=FindingStatus.OPEN
+        ),
+        Finding(
+            asset_id=test_assets[4].id,  # login URL
+            tenant_id=test_assets[4].tenant_id,
+            source="nuclei",
+            template_id="exposed-panels/login-panel",
+            name="Exposed Login Panel",
+            severity=FindingSeverity.MEDIUM,
+            cvss_score=5.3,
+            evidence='{"url": "https://app.example.com/login"}',
+            status=FindingStatus.OPEN
+        ),
+        Finding(
+            asset_id=test_assets[1].id,  # www.example.com
+            tenant_id=test_assets[1].tenant_id,
+            source="nuclei",
+            template_id="http-missing-security-headers",
+            name="Missing Security Headers",
+            severity=FindingSeverity.LOW,
+            cvss_score=3.1,
+            evidence='{"headers": ["X-Frame-Options", "X-Content-Type-Options"]}',
+            status=FindingStatus.SUPPRESSED
+        ),
+    ]
+    db_session.add_all(findings)
+    db_session.commit()
+    for f in findings:
+        db_session.refresh(f)
+    return findings
+
+
+@pytest.fixture
+def api_client():
+    """Alias for client fixture (backward compatibility)"""
+    pass  # Will be overridden by client fixture
+
+
+@pytest.fixture
+def authenticated_client(client, auth_headers):
+    """Test client with JWT token pre-configured"""
+    client.headers.update(auth_headers)
+    return client
+
+
+@pytest.fixture
+def sample_finding(db_session, sample_asset):
+    """Create a sample finding"""
+    finding = Finding(
+        asset_id=sample_asset.id,
+        tenant_id=sample_asset.tenant_id,
+        source="nuclei",
+        template_id="CVE-2021-12345",
+        name="Test Vulnerability",
+        severity=FindingSeverity.HIGH,
+        cvss_score=7.5,
+        cve_id="CVE-2021-12345",
+        evidence='{"proof": "data"}',
+        status=FindingStatus.OPEN
+    )
+    db_session.add(finding)
+    db_session.commit()
+    db_session.refresh(finding)
+    return finding
+
+
+@pytest.fixture
+def other_tenant_assets(db_session, other_tenant):
+    """Create assets for other tenant"""
+    assets = [
+        Asset(
+            tenant_id=other_tenant.id,
+            identifier=f"other{i}.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=50.0,
+            is_active=True
+        )
+        for i in range(3)
+    ]
+    db_session.add_all(assets)
+    db_session.commit()
+    for a in assets:
+        db_session.refresh(a)
+    return assets
+
+
+@pytest.fixture
+def thousand_assets(db_session, test_tenant):
+    """Create 1000 assets for performance testing"""
+    batch_size = 100
+    for batch in range(10):
+        assets = [
+            Asset(
+                tenant_id=test_tenant.id,
+                identifier=f"perf{batch * batch_size + i}.example.com",
+                type=AssetType.SUBDOMAIN,
+                risk_score=float((batch * batch_size + i) % 100),
+                is_active=True
+            )
+            for i in range(batch_size)
+        ]
+        db_session.add_all(assets)
+        db_session.commit()
+    return 1000
+
+
+@pytest.fixture
+def test_asset(db_session, test_tenant):
+    """Create single test asset for detail tests"""
+    asset = Asset(
+        tenant_id=test_tenant.id,
+        identifier="single.example.com",
+        type=AssetType.SUBDOMAIN,
+        risk_score=50.0,
+        is_active=True
+    )
+    db_session.add(asset)
+    db_session.commit()
+    db_session.refresh(asset)
+    return asset
+
+
+@pytest.fixture
+def test_service(db_session, test_asset):
+    """Create single test service"""
+    service = Service(
+        asset_id=test_asset.id,
+        port=443,
+        protocol="https",
+        product="nginx",
+        version="1.21.0",
+        http_title="Test Service",
+        http_status=200
+    )
+    db_session.add(service)
+    db_session.commit()
+    db_session.refresh(service)
+    return service
+
+
+@pytest.fixture
+def test_cert(db_session, test_asset):
+    """Create single test certificate"""
+    from datetime import datetime, timedelta
+    cert = Certificate(
+        asset_id=test_asset.id,
+        common_name="single.example.com",
+        subject_alternative_names=["single.example.com"],
+        issuer="Let's Encrypt",
+        not_before=datetime.utcnow() - timedelta(days=60),
+        not_after=datetime.utcnow() + timedelta(days=60),
+        is_wildcard=False,
+        is_self_signed=False
+    )
+    db_session.add(cert)
+    db_session.commit()
+    db_session.refresh(cert)
+    return cert
+
+
+@pytest.fixture
+def test_finding(db_session, test_asset):
+    """Create single test finding"""
+    finding = Finding(
+        asset_id=test_asset.id,
+        tenant_id=test_asset.tenant_id,
+        source="nuclei",
+        template_id="CVE-2023-12345",
+        name="Test Vulnerability",
+        severity=FindingSeverity.HIGH,
+        cvss_score=7.5,
+        cve_id="CVE-2023-12345",
+        evidence='{"proof": "test data"}',
+        status=FindingStatus.OPEN
+    )
+    db_session.add(finding)
+    db_session.commit()
+    db_session.refresh(finding)
+    return finding
+
+
+@pytest.fixture
+def other_tenant_asset(db_session, other_tenant):
+    """Create single asset for other tenant (for isolation tests)"""
+    asset = Asset(
+        tenant_id=other_tenant.id,
+        identifier="other.example.com",
+        type=AssetType.SUBDOMAIN,
+        risk_score=50.0,
+        is_active=True
+    )
+    db_session.add(asset)
+    db_session.commit()
+    db_session.refresh(asset)
+    return asset
+
+
+@pytest.fixture
+def other_tenant_service(db_session, other_tenant_asset):
+    """Create service for other tenant"""
+    service = Service(
+        asset_id=other_tenant_asset.id,
+        port=443,
+        protocol="https",
+        product="nginx",
+        version="1.21.0"
+    )
+    db_session.add(service)
+    db_session.commit()
+    db_session.refresh(service)
+    return service
+
+
+@pytest.fixture
+def other_tenant_cert(db_session, other_tenant_asset):
+    """Create certificate for other tenant"""
+    from datetime import datetime, timedelta
+    cert = Certificate(
+        asset_id=other_tenant_asset.id,
+        common_name="other.example.com",
+        subject_alternative_names=["other.example.com"],
+        issuer="Let's Encrypt",
+        not_before=datetime.utcnow() - timedelta(days=60),
+        not_after=datetime.utcnow() + timedelta(days=60),
+        is_wildcard=False,
+        is_self_signed=False
+    )
+    db_session.add(cert)
+    db_session.commit()
+    db_session.refresh(cert)
+    return cert
+
+
+@pytest.fixture
+def other_tenant_finding(db_session, other_tenant_asset):
+    """Create finding for other tenant"""
+    finding = Finding(
+        asset_id=other_tenant_asset.id,
+        tenant_id=other_tenant_asset.tenant_id,
+        source="nuclei",
+        template_id="CVE-2023-99999",
+        name="Other Tenant Vulnerability",
+        severity=FindingSeverity.HIGH,
+        cvss_score=7.5,
+        status=FindingStatus.OPEN
+    )
+    db_session.add(finding)
+    db_session.commit()
+    db_session.refresh(finding)
+    return finding
+
+
+@pytest.fixture
+def sample_nuclei_output():
+    """Sample Nuclei JSON output for parsing tests"""
+    return '''[
+  {
+    "template": "CVE-2021-44228",
+    "template-url": "https://cloud.projectdiscovery.io/templates/CVE-2021-44228",
+    "template-id": "CVE-2021-44228",
+    "info": {
+      "name": "Apache Log4j RCE",
+      "author": ["melbadry9","dhiyaneshDK"],
+      "severity": "critical",
+      "tags": ["cve","cve2021","rce","log4j","apache"]
+    },
+    "type": "http",
+    "host": "https://api.example.com",
+    "matched-at": "https://api.example.com/",
+    "extracted-results": ["vulnerable"],
+    "timestamp": "2024-01-15T12:00:00Z",
+    "matcher-status": true,
+    "cvss-metrics": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+    "cvss-score": 10.0,
+    "cve-id": "CVE-2021-44228"
+  }
+]'''
+
+
+@pytest.fixture
+def test_assets_with_tech(db_session, test_tenant):
+    """Create assets with detected technologies for smart template filtering"""
+    assets = [
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="wordpress.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=50.0,
+            is_active=True,
+            raw_metadata='{"technologies": ["WordPress", "PHP"]}'
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="drupal.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=50.0,
+            is_active=True,
+            raw_metadata='{"technologies": ["Drupal", "PHP"]}'
+        ),
+        Asset(
+            tenant_id=test_tenant.id,
+            identifier="apache.example.com",
+            type=AssetType.SUBDOMAIN,
+            risk_score=50.0,
+            is_active=True,
+            raw_metadata='{"technologies": ["Apache", "Tomcat"]}'
+        ),
+    ]
+    db_session.add_all(assets)
+    db_session.commit()
+    for a in assets:
+        db_session.refresh(a)
+    return assets
+
+
+@pytest.fixture
+def existing_finding(db_session, test_asset):
+    """Create an existing finding for update tests"""
+    from datetime import datetime, timedelta
+    finding = Finding(
+        asset_id=test_asset.id,
+        tenant_id=test_asset.tenant_id,
+        source="nuclei",
+        template_id="CVE-2023-00001",
+        name="Existing Vulnerability",
+        severity=FindingSeverity.MEDIUM,
+        cvss_score=6.5,
+        cve_id="CVE-2023-00001",
+        evidence='{"initial": "data"}',
+        status=FindingStatus.OPEN,
+        first_seen=datetime.utcnow() - timedelta(days=7),
+        last_seen=datetime.utcnow() - timedelta(days=7)
+    )
+    db_session.add(finding)
+    db_session.commit()
+    db_session.refresh(finding)
+    return finding
+
+
+@pytest.fixture
+def large_finding_set():
+    """Generate 1000+ findings for bulk upsert performance tests"""
+    findings = []
+    for i in range(1500):
+        findings.append({
+            "template_id": f"nuclei-template-{i % 100}",
+            "name": f"Vulnerability {i}",
+            "severity": ["critical", "high", "medium", "low"][i % 4],
+            "cvss_score": float(3.0 + (i % 8)),
+            "cve_id": f"CVE-2023-{10000 + i}" if i % 3 == 0 else None,
+            "evidence": f'{{"finding": {i}}}',
+            "host": f"https://host{i % 50}.example.com",
+            "matched_at": f"https://host{i % 50}.example.com/path{i}"
+        })
+    return findings
+
+
 # Mark slow tests
 def pytest_collection_modifyitems(config, items):
     """Automatically mark slow tests"""

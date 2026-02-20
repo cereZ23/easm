@@ -85,22 +85,36 @@ def run_enrichment_pipeline(
 
         tenant_logger.info(f"Enriching {len(candidates)} assets")
 
-        # Phase 1: Run HTTPx + Naabu + TLSx in parallel
-        parallel_job = group(
+        # Phase 1: Run HTTPx + Naabu + TLSx in parallel using chord
+        # IMPORTANT: chord() waits for all group tasks to complete before callback
+        # group() + chain() doesn't wait, it proceeds after first task completes!
+        parallel_tasks = [
             run_httpx.si(tenant_id, candidates),
             run_naabu.si(tenant_id, candidates),
             run_tlsx.si(tenant_id, candidates)
-        )
+        ]
 
-        # Phase 2: Run Katana after HTTPx
-        # Note: We run Katana for all assets, it will filter to live web services
-        enrichment_chain = chain(
-            parallel_job,
-            run_katana.si(tenant_id, candidates)
-        )
+        # Phase 2: Run Katana after all enrichment completes
+        # Phase 3: Run Nuclei after Katana (if enabled)
+        # chord(group_of_tasks, callback) - callback runs after ALL group tasks complete
+        from celery import chord
 
-        # Execute the pipeline
-        result = enrichment_chain.apply_async()
+        if settings.feature_nuclei_enabled:
+            from app.tasks.scanning import run_nuclei_scan
+
+            # Use chord to wait for ALL enrichment tasks, then run Katana, then Nuclei
+            # chord() returns an AsyncResult when called, don't call apply_async() again
+            result = chord(parallel_tasks)(
+                chain(
+                    run_katana.si(tenant_id, candidates),
+                    run_nuclei_scan.si(tenant_id, candidates, ['critical', 'high', 'medium'])
+                )
+            )
+        else:
+            # Use chord to wait for ALL enrichment tasks, then run Katana
+            result = chord(parallel_tasks)(
+                run_katana.si(tenant_id, candidates)
+            )
 
         return {
             'tenant_id': tenant_id,
@@ -253,9 +267,10 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
             tenant_logger.warning(f"No assets found for HTTPx (IDs: {asset_ids})")
             return {'services_enriched': 0}
 
-        # Build URL list from assets
+        # Build URL list from assets and maintain asset_id mapping
         # HTTPx accepts domains, IPs, and URLs
         urls = []
+        url_to_asset_id = {}  # Map URLs to asset IDs for later matching
         url_validator = URLValidator()
 
         for asset in assets:
@@ -266,6 +281,7 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
                     is_valid, _ = url_validator.validate_url(url)
                     if is_valid:
                         urls.append(url)
+                        url_to_asset_id[asset.identifier.lower()] = asset.id  # Map host to asset_id
             elif asset.type == AssetType.IP:
                 # Try common web ports
                 for port in [80, 443, 8080, 8443]:
@@ -274,48 +290,55 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
                     is_valid, _ = url_validator.validate_url(url)
                     if is_valid:
                         urls.append(url)
+                        url_to_asset_id[asset.identifier.lower()] = asset.id  # Map IP to asset_id
             elif asset.type == AssetType.URL:
                 is_valid, _ = url_validator.validate_url(asset.identifier)
                 if is_valid:
                     urls.append(asset.identifier)
+                    # For URL type, extract host for mapping
+                    parsed = urlparse(asset.identifier)
+                    if parsed.hostname:
+                        url_to_asset_id[parsed.hostname.lower()] = asset.id
 
         if not urls:
             tenant_logger.warning(f"No valid URLs for HTTPx (tenant {tenant_id})")
             return {'services_enriched': 0}
 
         tenant_logger.info(f"Running HTTPx on {len(urls)} URLs (tenant {tenant_id})")
+        tenant_logger.info(f"HTTPx URLs: {urls[:5]}...")  # Log first 5 URLs
 
         # Execute HTTPx with secure executor
         with SecureToolExecutor(tenant_id) as executor:
-            # Create input file
+            # Use stdin instead of file to avoid HTTPx memory leak with -l flag
             urls_content = '\n'.join(urls)
-            input_file = executor.create_input_file('urls.txt', urls_content)
 
-            # Execute HTTPx
+            # Execute HTTPx with stdin
             returncode, stdout, stderr = executor.execute(
                 'httpx',
                 [
-                    '-l', input_file,
                     '-json',                    # JSON output
                     '-status-code',             # Include status code
                     '-title',                   # Include page title
                     '-web-server',              # Detect web server
-                    '-tech-detect',             # Detect technologies
+                    '-tech-detect',             # Detect technologies (safe in v1.6.8)
                     '-response-time',           # Include response time
                     '-content-length',          # Include content length
                     '-follow-redirects',        # Follow redirects
                     '-max-redirects', '3',      # Limit redirects
                     '-no-color',                # Disable colors
                     '-silent',                  # Minimal output
+                    '-threads', '10',           # Use 10 threads for better performance
                     '-timeout', str(settings.httpx_timeout),
                     '-rate-limit', str(settings.httpx_rate_limit)
                 ],
-                timeout=settings.httpx_timeout
+                timeout=settings.httpx_timeout,
+                stdin_data=urls_content        # Pass URLs via stdin
             )
 
             if returncode != 0:
                 tenant_logger.warning(f"HTTPx returned non-zero exit code: {returncode}")
-                tenant_logger.debug(f"HTTPx stderr: {stderr}")
+                tenant_logger.warning(f"HTTPx stderr: {stderr}")
+                tenant_logger.warning(f"HTTPx stdout length: {len(stdout)}")
 
             # Parse JSON output
             services_data = []
@@ -329,29 +352,47 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
                     # Extract service data
                     service_data = parse_httpx_result(result, tenant_logger)
                     if service_data:
-                        services_data.append(service_data)
+                        # Match host to asset_id using our mapping
+                        host = service_data.get('host', '').lower()
+                        asset_id = url_to_asset_id.get(host)
+                        if asset_id:
+                            service_data['asset_id'] = asset_id
+                            services_data.append(service_data)
+                        else:
+                            tenant_logger.warning(f"No asset found for host: {host}")
 
                 except json.JSONDecodeError as e:
                     tenant_logger.warning(f"Failed to parse HTTPx JSON: {e}")
                     continue
 
             # Store raw output in MinIO
-            store_raw_output(tenant_id, 'httpx', {'urls': urls, 'results': services_data})
+            try:
+                store_raw_output(tenant_id, 'httpx', {'urls': urls, 'results': services_data})
+            except Exception as e:
+                tenant_logger.warning(f"Failed to store HTTPx raw output: {e}")
 
             # Upsert services to database
             service_repo = ServiceRepository(db)
             total_created = 0
             total_updated = 0
 
-            # Group services by asset
+            # Group services by asset and deduplicate by port
+            # HTTPx may return duplicate results (e.g., redirects, multiple probes)
             services_by_asset = {}
             for service in services_data:
                 asset_id = service['asset_id']
-                if asset_id not in services_by_asset:
-                    services_by_asset[asset_id] = []
-                services_by_asset[asset_id].append(service)
+                port = service['port']
 
-            for asset_id, asset_services in services_by_asset.items():
+                if asset_id not in services_by_asset:
+                    services_by_asset[asset_id] = {}
+
+                # Deduplicate by port - keep latest result
+                # This prevents PostgreSQL CardinalityViolation errors
+                services_by_asset[asset_id][port] = service
+
+            for asset_id, services_dict in services_by_asset.items():
+                # Convert dict back to list for bulk_upsert
+                asset_services = list(services_dict.values())
                 result = service_repo.bulk_upsert(asset_id, asset_services)
                 total_created += result['created']
                 total_updated += result['updated']
@@ -613,13 +654,11 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
 
         # Execute Naabu with secure executor
         with SecureToolExecutor(tenant_id) as executor:
-            # Create input file
+            # Use stdin instead of file input for better reliability
             hosts_content = '\n'.join(hosts)
-            input_file = executor.create_input_file('hosts.txt', hosts_content)
 
-            # Build arguments
+            # Build arguments (no -l flag, use stdin)
             args = [
-                '-l', input_file,
                 '-json',
                 '-silent',
                 '-rate', str(settings.naabu_rate_limit or 1000)
@@ -636,11 +675,12 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
                 exclude_ports = ','.join(map(str, settings.naabu_blocked_ports))
                 args.extend(['-exclude-ports', exclude_ports])
 
-            # Execute Naabu
+            # Execute Naabu with stdin
             returncode, stdout, stderr = executor.execute(
                 'naabu',
                 args,
-                timeout=settings.naabu_timeout
+                timeout=settings.naabu_timeout,
+                stdin_data=hosts_content
             )
 
             if returncode != 0:
@@ -662,7 +702,10 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
                     continue
 
             # Store raw output
-            store_raw_output(tenant_id, 'naabu', {'hosts': hosts, 'results': services_data})
+            try:
+                store_raw_output(tenant_id, 'naabu', {'hosts': hosts, 'results': services_data})
+            except Exception as e:
+                tenant_logger.warning(f"Failed to store Naabu raw output: {e}")
 
             # Upsert services to database
             # (Similar to HTTPx, group by asset and bulk upsert)
@@ -818,15 +861,13 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
 
         # Execute TLSx with secure executor
         with SecureToolExecutor(tenant_id) as executor:
-            # Create input file
+            # Use stdin instead of file input
             hosts_content = '\n'.join(hosts)
-            input_file = executor.create_input_file('hosts.txt', hosts_content)
 
-            # Execute TLSx
+            # Execute TLSx with stdin
             returncode, stdout, stderr = executor.execute(
                 'tlsx',
                 [
-                    '-l', input_file,
                     '-json',
                     '-silent',
                     '-san',               # Include SANs
@@ -835,7 +876,8 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
                     '-tls-version',       # Include TLS version
                     '-hash', 'sha256'     # Certificate hash
                 ],
-                timeout=settings.tlsx_timeout
+                timeout=settings.tlsx_timeout,
+                stdin_data=hosts_content
             )
 
             if returncode != 0:
@@ -871,15 +913,18 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
                     continue
 
             # Store raw output (sanitized)
-            store_raw_output(
-                tenant_id,
-                'tlsx',
-                {
-                    'hosts': hosts,
-                    'results': certificates_data,
-                    'private_key_detected': private_key_detected
-                }
-            )
+            try:
+                store_raw_output(
+                    tenant_id,
+                    'tlsx',
+                    {
+                        'hosts': hosts,
+                        'results': certificates_data,
+                        'private_key_detected': private_key_detected
+                    }
+                )
+            except Exception as e:
+                tenant_logger.warning(f"Failed to store TLSx raw output: {e}")
 
             # Upsert certificates to database
             # (Similar pattern to HTTPx/Naabu)

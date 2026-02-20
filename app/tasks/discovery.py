@@ -85,7 +85,7 @@ def run_tenant_discovery(tenant_id: int):
                 run_parallel_enumeration.s(tenant_id),
                 run_dnsx.s(tenant_id),
                 process_discovery_results.s(tenant_id)
-            ).apply_async(queue=f'tenant_{tenant_id}')
+            ).apply_async()  # Use default queue
 
             tenant_logger.info("Discovery chain started successfully (with Amass)")
             return {
@@ -109,8 +109,8 @@ def run_parallel_enumeration(seed_data: dict, tenant_id: int):
     """
     Run Subfinder and Amass in parallel, then merge results
 
-    This coordinating task launches both enumeration tools simultaneously
-    and waits for both to complete before merging their results.
+    This task calls the enumeration functions directly (synchronously)
+    to avoid chain complexity and ensure results are properly passed.
 
     Args:
         seed_data: Dict from collect_seeds
@@ -119,21 +119,13 @@ def run_parallel_enumeration(seed_data: dict, tenant_id: int):
     Returns:
         Merged results from both tools
     """
-    from celery import group
-
     logger.info(f"Starting parallel enumeration for tenant {tenant_id}")
 
     if settings.discovery_amass_enabled:
-        # Run both Subfinder and Amass in parallel
-        job = group(
-            run_subfinder.si(seed_data, tenant_id),
-            run_amass.si(seed_data, tenant_id)
-        )
-        results = job.apply_async().get()
-
-        # Results is a list: [subfinder_result, amass_result]
-        subfinder_result = results[0] if len(results) > 0 else {'subdomains': []}
-        amass_result = results[1] if len(results) > 1 else {'subdomains': []}
+        # Run both tools directly (they execute independently)
+        # This is acceptable because we're calling them from a worker task
+        subfinder_result = run_subfinder(seed_data, tenant_id)
+        amass_result = run_amass(seed_data, tenant_id)
 
         # Merge results
         merged = merge_discovery_results(subfinder_result, amass_result, tenant_id)
@@ -147,7 +139,9 @@ def run_parallel_enumeration(seed_data: dict, tenant_id: int):
     else:
         # Amass disabled, just run Subfinder
         logger.info(f"Amass disabled, running Subfinder only (tenant {tenant_id})")
-        return run_subfinder(seed_data, tenant_id)
+        subfinder_result = run_subfinder(seed_data, tenant_id)
+        # Return merged results with empty amass data
+        return merge_discovery_results(subfinder_result, {'subdomains': []}, tenant_id)
 
 @celery.task(name='app.tasks.discovery.watch_critical_assets')
 def watch_critical_assets():
@@ -419,11 +413,14 @@ def run_subfinder(seed_data: dict, tenant_id: int):
 
             logger.info(f"Subfinder found {len(subdomains)} subdomains (tenant {tenant_id})")
 
-            # Store raw output
-            store_raw_output(tenant_id, 'subfinder', {
-                'input_domains': validated_domains,
-                'subdomains': subdomains
-            })
+            # Store raw output (non-blocking)
+            try:
+                store_raw_output(tenant_id, 'subfinder', {
+                    'input_domains': validated_domains,
+                    'subdomains': subdomains
+                })
+            except Exception as e:
+                logger.warning(f"Failed to store subfinder raw output (tenant {tenant_id}): {e}")
 
             return {
                 'subdomains': subdomains,
@@ -496,13 +493,14 @@ def run_amass(seed_data: dict, tenant_id: int):
 
                 # Execute Amass enum in passive mode
                 # Passive mode is faster and doesn't generate traffic to target
+                # Amass v4 outputs text to stdout (no -json flag in v4)
                 returncode, stdout, stderr = executor.execute(
                     'amass',
                     [
                         'enum',
                         '-passive',  # Passive enumeration only
                         '-d', domain,
-                        '-json', output_file
+                        '-timeout', '60'  # 60 second timeout
                     ],
                     timeout=settings.discovery_amass_timeout
                 )
@@ -510,22 +508,24 @@ def run_amass(seed_data: dict, tenant_id: int):
                 if returncode != 0:
                     logger.warning(f"Amass warning for {domain} (tenant {tenant_id}): {stderr}")
 
-                # Parse JSON output (Amass outputs JSONL - one JSON object per line)
+                # Parse text output from stdout (Amass v4 format: "subdomain (FQDN) --> record --> ...")
+                # Extract FQDNs from lines like: "www.example.com (FQDN) --> cname_record --> ..."
                 try:
-                    output_content = executor.read_output_file(output_file)
-                    for line in output_content.strip().split('\n'):
-                        if not line.strip():
+                    for line in stdout.strip().split('\n'):
+                        if not line.strip() or '(FQDN)' not in line:
                             continue
+
+                        # Extract the FQDN before " (FQDN)"
                         try:
-                            data = json.loads(line)
-                            # Amass JSON format: {"name": "subdomain.example.com", "domain": "example.com", ...}
-                            if 'name' in data:
-                                all_subdomains.append(data['name'])
-                        except json.JSONDecodeError as je:
-                            logger.debug(f"Failed to parse Amass JSON line: {line[:100]}")
+                            fqdn = line.split(' (FQDN)')[0].strip()
+                            # Validate it's actually a subdomain of our target domain
+                            if fqdn and (fqdn.endswith(f'.{domain}') or fqdn == domain):
+                                all_subdomains.append(fqdn)
+                        except Exception as pe:
+                            logger.debug(f"Failed to parse Amass line: {line[:100]}")
                             continue
                 except Exception as e:
-                    logger.warning(f"Error reading Amass output for {domain}: {e}")
+                    logger.warning(f"Error parsing Amass output for {domain}: {e}")
                     continue
 
             # Deduplicate subdomains
@@ -533,13 +533,16 @@ def run_amass(seed_data: dict, tenant_id: int):
 
             logger.info(f"Amass found {len(unique_subdomains)} unique subdomains (tenant {tenant_id})")
 
-            # Store raw output
-            store_raw_output(tenant_id, 'amass', {
-                'input_domains': validated_domains,
-                'subdomains': unique_subdomains,
-                'total_found': len(all_subdomains),
-                'unique_found': len(unique_subdomains)
-            })
+            # Store raw output (non-blocking)
+            try:
+                store_raw_output(tenant_id, 'amass', {
+                    'input_domains': validated_domains,
+                    'subdomains': unique_subdomains,
+                    'total_found': len(all_subdomains),
+                    'unique_found': len(unique_subdomains)
+                })
+            except Exception as e:
+                logger.warning(f"Failed to store amass raw output (tenant {tenant_id}): {e}")
 
             return {
                 'subdomains': unique_subdomains,
@@ -591,16 +594,19 @@ def merge_discovery_results(subfinder_result: dict, amass_result: dict, tenant_i
         f"Unique to Amass={len(unique_to_amass)}"
     )
 
-    # Store merge statistics
-    store_raw_output(tenant_id, 'discovery_merge', {
-        'subfinder_count': len(subfinder_subs),
-        'amass_count': len(amass_subs),
-        'total_unique': len(all_subdomains),
-        'overlap_count': len(overlap),
-        'unique_to_subfinder': len(unique_to_subfinder),
-        'unique_to_amass': len(unique_to_amass),
-        'coverage_improvement': round((len(unique_to_amass) / len(subfinder_subs) * 100) if subfinder_subs else 0, 2)
-    })
+    # Store merge statistics (non-blocking - S3 errors won't crash pipeline)
+    try:
+        store_raw_output(tenant_id, 'discovery_merge', {
+            'subfinder_count': len(subfinder_subs),
+            'amass_count': len(amass_subs),
+            'total_unique': len(all_subdomains),
+            'overlap_count': len(overlap),
+            'unique_to_subfinder': len(unique_to_subfinder),
+            'unique_to_amass': len(unique_to_amass),
+            'coverage_improvement': round((len(unique_to_amass) / len(subfinder_subs) * 100) if subfinder_subs else 0, 2)
+        })
+    except Exception as e:
+        logger.warning(f"Failed to store raw output for merge (tenant {tenant_id}): {e}")
 
     return {
         'subdomains': all_subdomains,
@@ -613,6 +619,28 @@ def merge_discovery_results(subfinder_result: dict, amass_result: dict, tenant_i
             'unique_to_amass': len(unique_to_amass)
         }
     }
+
+@celery.task(name='app.tasks.discovery.merge_discovery_results_task')
+def merge_discovery_results_task(results: list, tenant_id: int):
+    """
+    Celery task wrapper for merge_discovery_results
+
+    This task receives results from a chord (parallel execution of subfinder and amass)
+    and merges them into a single result set.
+
+    Args:
+        results: List of [subfinder_result, amass_result] from chord
+        tenant_id: Tenant ID
+
+    Returns:
+        Merged discovery results
+    """
+    # Extract results from the list
+    subfinder_result = results[0] if len(results) > 0 else {'subdomains': []}
+    amass_result = results[1] if len(results) > 1 else {'subdomains': []}
+
+    # Call the merge function
+    return merge_discovery_results(subfinder_result, amass_result, tenant_id)
 
 @celery.task(name='app.tasks.discovery.run_dnsx')
 def run_dnsx(subfinder_result: dict, tenant_id: int):
@@ -675,8 +703,11 @@ def run_dnsx(subfinder_result: dict, tenant_id: int):
 
             logger.info(f"Dnsx resolved {len(resolved_records)} records (tenant {tenant_id})")
 
-            # Store raw output
-            store_raw_output(tenant_id, 'dnsx', resolved_records)
+            # Store raw output (non-blocking)
+            try:
+                store_raw_output(tenant_id, 'dnsx', resolved_records)
+            except Exception as e:
+                logger.warning(f"Failed to store dnsx raw output (tenant {tenant_id}): {e}")
 
             return {
                 'resolved': resolved_records,
