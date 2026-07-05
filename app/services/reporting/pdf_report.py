@@ -253,6 +253,10 @@ def _styles() -> Dict[str, ParagraphStyle]:
     s["finding_name"] = ParagraphStyle(
         "finding_name", fontName="Helvetica-Bold", fontSize=9, leading=12, textColor=INK,
     )
+    s["finding_impl"] = ParagraphStyle(
+        "finding_impl", fontName="Helvetica-Oblique", fontSize=7.6, leading=10,
+        textColor=MUTED, spaceBefore=1.5,
+    )
     s["reco"] = ParagraphStyle(
         "reco", fontName="Helvetica", fontSize=9.3, leading=13.5, textColor=INK,
         spaceAfter=7, leftIndent=2,
@@ -336,8 +340,34 @@ def _collect(db, tenant_id: int) -> Dict[str, Any]:
     }
 
 
+def _exposure_amplifiers(data: Dict[str, Any]) -> List[str]:
+    """Short human phrases describing exposure that raises risk beyond raw severity."""
+    obs = _exec_observations(data)
+    amps: List[str] = []
+    if obs["support"]:
+        amps.append("a publicly exposed support portal")
+    if obs["panels"]:
+        amps.append("internet-facing administrative / hosting login panel(s)")
+    interesting = [a for a in data["assets"]
+                   if _is_interesting_asset(getattr(a, "identifier", ""))]
+    if interesting:
+        amps.append(f"{len(interesting)} non-production / restricted-use host(s) "
+                    f"reachable from the internet")
+    if obs["headers"] or obs["csp"]:
+        amps.append("missing or weak HTTP security headers")
+    if data["cert_stats"].get("expired", 0):
+        amps.append(f"{data['cert_stats']['expired']} expired TLS certificate(s)")
+    return amps
+
+
 def _risk_posture(data: Dict[str, Any]) -> Tuple[str, colors.Color]:
-    """Derive an overall risk posture from findings + asset risk scores."""
+    """Derive an overall risk posture from worst severities *and* exposure.
+
+    Even when automated scanning only yields informational/low findings, a broad
+    exposed footprint (support portals, admin panels, non-prod hosts, weak TLS)
+    warrants a rating above the bare minimum — this mirrors how a human assessor
+    would reason about the estate.
+    """
     by_sev = data["by_sev"]
     if by_sev.get("critical", 0) > 0:
         return "Critical", SEV_COLORS["critical"]
@@ -346,9 +376,45 @@ def _risk_posture(data: Dict[str, Any]) -> Tuple[str, colors.Color]:
     max_risk = max([getattr(a, "risk_score", 0.0) or 0.0 for a in data["assets"]] + [0.0])
     if by_sev.get("medium", 0) > 0 or max_risk >= 50:
         return "Medium", SEV_COLORS["medium"]
-    if by_sev.get("low", 0) > 0 or by_sev.get("info", 0) > 0 or max_risk >= 20:
+
+    amplifiers = len(_exposure_amplifiers(data))
+    has_low_info = (by_sev.get("low", 0) + by_sev.get("info", 0)) > 0
+    if has_low_info and (amplifiers >= 2 or max_risk >= 30):
+        # Meaningful exposure sitting on top of low-severity findings.
+        return "Moderate", SEV_COLORS["medium"]
+    if has_low_info or max_risk >= 15:
         return "Low", SEV_COLORS["low"]
-    return "Low", SEV_COLORS["low"]
+    return "Minimal", SEV_COLORS["info"]
+
+
+def _exec_observations(data: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Classify findings into observation buckets, each with representative hosts."""
+    finds = data.get("findings", []) or []
+
+    def hosts_for(pred) -> List[str]:
+        out: List[str] = []
+        for f in finds:
+            name = (getattr(f, "name", None) or "").lower()
+            if not pred(name):
+                continue
+            host = _s(getattr(f, "host", None) or getattr(f, "matched_at", None), "")
+            if host and host not in out:
+                out.append(host)
+        return out
+
+    return {
+        "support": hosts_for(lambda n: "osticket" in n or "ticket" in n
+                             or "helpdesk" in n or "support portal" in n),
+        "panels": hosts_for(lambda n: "plesk" in n or "cpanel" in n or "webmin" in n
+                            or "phpmyadmin" in n or ("login panel" in n
+                            and "osticket" not in n and "ticket" not in n)),
+        "headers": hosts_for(lambda n: "security header" in n or "x-frame" in n
+                             or "hsts" in n or "strict-transport" in n
+                             or "xss-protection" in n or "subresource integrity" in n),
+        "csp": hosts_for(lambda n: "content security policy" in n or "csp" in n),
+        "cookie": hosts_for(lambda n: "cookie" in n or "samesite" in n),
+        "redirect": hosts_for(lambda n: "redirect" in n or "https to http" in n),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +499,14 @@ def _kpi_cards(data: Dict, content_w: float, st: Dict) -> Table:
     ]
 
     def card_cell(label, value, accent):
+        # Numbers stay large; word values (e.g. risk posture) use a smaller size
+        # so they never wrap mid-word inside the narrow tile.
+        if value.replace(",", "").isdigit():
+            v_size, v_lead = (19, 22) if len(value) <= 4 else (16, 19)
+        else:
+            v_size, v_lead = 13, 16
         val_style = ParagraphStyle(
-            "kpi_val", fontName="Helvetica-Bold", fontSize=19, leading=22,
+            "kpi_val", fontName="Helvetica-Bold", fontSize=v_size, leading=v_lead,
             textColor=accent, alignment=TA_LEFT,
         )
         lab_style = ParagraphStyle(
@@ -469,60 +541,253 @@ def _kpi_cards(data: Dict, content_w: float, st: Dict) -> Table:
     return grid
 
 
-def _build_exec_summary(story, data, content_w, st, client_name):
-    _section_header(story, st, "Section 01", "Executive Summary", content_w)
+def _fmt_hosts(hosts: List[str], limit: int = 2) -> str:
+    """Render 'a', 'a and b', or 'a, b and N others' from a host list."""
+    hosts = [h for h in hosts if h][:20]
+    if not hosts:
+        return ""
+    shown = hosts[:limit]
+    body = ", ".join(shown[:-1]) + (" and " + shown[-1] if len(shown) > 1 else shown[0])
+    extra = len(hosts) - len(shown)
+    if extra > 0:
+        body += f" (and {extra} other host{'s' if extra != 1 else ''})"
+    return body
 
+
+def _narrative_paragraphs(data, client_name, report_date) -> List[str]:
+    """Generate a senior-consultant-style, data-driven executive narrative.
+
+    Returns a list of HTML-ish paragraph strings (bold markup allowed) covering
+    scope & methodology, risk posture with justification, the most significant
+    observations in prose, and business impact + a bottom-line recommendation.
+    """
     posture, _ = _risk_posture(data)
+    by_sev = data["by_sev"]
     n_assets = len(data["assets"])
     n_services = len(data["services"])
+    n_ports = len({(s.asset_id, s.port) for s in data["services"] if s.port})
+    n_certs = data["cert_stats"].get("total", 0)
+    n_endpoints = data["ep_stats"].get("total", 0)
+    n_api = data["ep_stats"].get("api_endpoints", 0)
     n_findings = data["finding_stats"].get("total", 0)
-    by_sev = data["by_sev"]
-    crit_high = by_sev.get("critical", 0) + by_sev.get("high", 0)
-    n_interesting = sum(1 for a in data["assets"]
-                        if _is_interesting_asset(getattr(a, "identifier", "")))
-    expiring = len(data["expiring"])
+    crit = by_sev.get("critical", 0)
+    high = by_sev.get("high", 0)
+    med = by_sev.get("medium", 0)
+    low = by_sev.get("low", 0)
+    info = by_sev.get("info", 0)
+    crit_high = crit + high
 
-    if n_findings == 0:
-        finding_sentence = (
-            "Automated vulnerability scanning did not surface any confirmed "
-            "findings across the assessed surface at the time of reporting."
+    obs = _exec_observations(data)
+    interesting = [_s(getattr(a, "identifier", "")) for a in data["assets"]
+                   if _is_interesting_asset(getattr(a, "identifier", ""))]
+    amplifiers = _exposure_amplifiers(data)
+
+    paras: List[str] = []
+
+    # --- Paragraph 1: scope & methodology -------------------------------------
+    paras.append(
+        f"This report presents the results of an external attack surface assessment "
+        f"performed for <b>{client_name}</b> and completed on {report_date}. The "
+        f"engagement combined passive reconnaissance with active discovery to map the "
+        f"organisation's internet-facing footprint, followed by service fingerprinting, "
+        f"TLS inspection, web-application crawling and automated vulnerability scanning. "
+        f"In total the assessment identified <b>{n_assets}</b> live internet-facing "
+        f"asset(s) exposing <b>{n_services}</b> network service(s) across "
+        f"<b>{n_ports}</b> open port(s), protected by <b>{n_certs}</b> TLS "
+        f"certificate(s), and catalogued <b>{n_endpoints:,}</b> web endpoint(s) "
+        f"(<b>{n_api:,}</b> of them API-style) during crawling."
+    )
+
+    # --- Paragraph 2: risk posture with justification -------------------------
+    n_fp = "finding" if n_findings == 1 else "findings"
+    ch_verb = "is" if crit_high == 1 else "are"
+    ch_verb2 = "represents" if crit_high == 1 else "represent"
+    if crit_high > 0:
+        sev_clause = (
+            f"Automated scanning confirmed <b>{n_findings}</b> {n_fp}, of which "
+            f"<b>{crit_high}</b> {ch_verb} of critical or high severity and {ch_verb2} "
+            f"the clearest opportunities for compromise."
+        )
+    elif med > 0:
+        sev_clause = (
+            f"Automated scanning confirmed <b>{n_findings}</b> {n_fp}, the most serious "
+            f"of which are of medium severity; no critical or high-severity "
+            f"vulnerabilities were observed at the time of testing."
+        )
+    elif n_findings > 0:
+        sev_clause = (
+            f"Automated scanning confirmed <b>{n_findings}</b> {n_fp}, all of "
+            f"informational or low severity, indicating that no directly exploitable "
+            f"critical or high-risk software vulnerabilities were present at the time "
+            f"of testing."
         )
     else:
-        finding_sentence = (
-            f"Automated scanning identified <b>{n_findings}</b> finding(s), including "
-            f"<b>{crit_high}</b> of critical or high severity that warrant prioritised "
-            f"remediation."
+        sev_clause = (
+            "Automated scanning did not confirm any exploitable software "
+            "vulnerabilities at the time of testing."
         )
 
-    para = (
-        f"This report presents the results of an external attack surface assessment "
-        f"conducted for <b>{client_name}</b>. Using passive and active discovery, the "
-        f"engagement mapped <b>{n_assets}</b> internet-facing asset(s) and enumerated "
-        f"<b>{n_services}</b> exposed network service(s). {finding_sentence} "
-        f"Of the discovered hosts, <b>{n_interesting}</b> exhibit naming patterns "
-        f"(development, internal, mail or staging) that typically merit tighter access "
-        f"controls. The overall risk posture of the external estate is assessed as "
-        f"<b>{posture.upper()}</b>."
-    )
-    story.append(Paragraph(para, st["body"]))
-    story.append(Spacer(1, 10))
-    story.append(_kpi_cards(data, content_w, st))
-    story.append(Spacer(1, 6))
+    if amplifiers and crit_high > 0:
+        # Severe findings drive the rating; exposure compounds it.
+        amp_clause = (
+            " This is further compounded by the estate's exposure profile, which "
+            "includes " + _join_list(amplifiers) + "."
+        )
+    elif amplifiers:
+        # No severe findings — exposure is the primary driver of the rating.
+        amp_clause = (
+            " The rating is driven primarily by <i>exposure</i> rather than by severe "
+            "software defects: the assessment observed " + _join_list(amplifiers) + "."
+        )
+    else:
+        amp_clause = (
+            " The external footprint is comparatively lean, with no significant "
+            "unintended exposure identified."
+        )
 
-    # Small callouts row
-    notes = []
-    if expiring:
-        notes.append(f"{expiring} certificate(s) expiring within 30 days")
+    paras.append(
+        f"On balance, the external estate is assessed as presenting a "
+        f"<b>{posture.upper()}</b> risk posture. {sev_clause}{amp_clause}"
+    )
+
+    # --- Paragraph 3: most significant observations, in prose -----------------
+    sentences: List[str] = []
+    if obs["support"]:
+        sentences.append(
+            f"A publicly reachable support portal (osTicket) was identified at "
+            f"<b>{_fmt_hosts(obs['support'])}</b>, exposing a customer-facing "
+            f"authentication interface directly to the internet."
+        )
+    if obs["panels"]:
+        sentences.append(
+            f"Administrative and hosting login panels are exposed at "
+            f"<b>{_fmt_hosts(obs['panels'])}</b>, broadening the authenticated attack "
+            f"surface available to opportunistic credential-based attacks."
+        )
+    if obs["headers"] or obs["csp"]:
+        hh = obs["headers"] or obs["csp"]
+        sentences.append(
+            f"Several hosts respond without a complete set of HTTP security headers — "
+            f"including HSTS, X-Frame-Options and a robust Content-Security-Policy "
+            f"(for example {_fmt_hosts(hh)}) — which increases exposure to clickjacking "
+            f"and content-injection techniques."
+        )
+    if obs["cookie"]:
+        sentences.append(
+            f"Session cookies at <b>{_fmt_hosts(obs['cookie'])}</b> are issued without a "
+            f"strict SameSite attribute, weakening defence-in-depth against cross-site "
+            f"request forgery."
+        )
+    if interesting:
+        sample = ", ".join(interesting[:4])
+        more = f" and {len(interesting) - 4} more" if len(interesting) > 4 else ""
+        sentences.append(
+            f"Discovery also revealed <b>{len(interesting)}</b> host(s) whose naming "
+            f"suggests non-production or restricted-use systems ({sample}{more}), which "
+            f"are typically not intended for unrestricted public access."
+        )
+    cert_bits = []
+    if data["cert_stats"].get("expired", 0):
+        cert_bits.append(f"{data['cert_stats']['expired']} expired")
     if data["cert_stats"].get("self_signed", 0):
-        notes.append(f"{data['cert_stats']['self_signed']} self-signed certificate(s)")
+        cert_bits.append(f"{data['cert_stats']['self_signed']} self-signed")
+    if cert_bits:
+        sentences.append(
+            f"On the transport layer, the certificate inventory includes "
+            f"{_join_list(cert_bits)} certificate(s) that undermine trust and should be "
+            f"remediated."
+        )
+    if not sentences:
+        sentences.append(
+            "No individually significant exposures were observed; the surface is "
+            "consistent with a well-maintained public estate."
+        )
+    paras.append("The most significant observations are as follows. " + " ".join(sentences))
+
+    # --- Paragraph 4: business impact + bottom line ---------------------------
+    if crit_high > 0:
+        impact = (
+            "From a business perspective these issues are material: they create a "
+            "realistic path to unauthorised access and should be treated as a priority "
+            "for remediation."
+        )
+        bottom = (
+            f"<b>Bottom line:</b> {client_name} should remediate the critical and "
+            f"high-severity findings on an expedited timeline and re-test to confirm "
+            f"closure before considering the exposure controlled."
+        )
+    else:
+        impact = (
+            "From a business perspective, the exposed administrative and support "
+            "interfaces represent the most material risk: they enlarge the authenticated "
+            "attack surface and are attractive targets for credential-stuffing and "
+            "brute-force activity, while the absence of hardening headers marginally "
+            "raises the likelihood of client-side attacks against the organisation's "
+            "users. Critically, none of the issues identified permit immediate "
+            "unauthenticated compromise, so the residual exposure is considered "
+            "manageable rather than urgent."
+        )
+        bottom = (
+            f"<b>Bottom line:</b> {client_name} maintains a broadly sound external "
+            f"security posture. Restricting access to non-production and administrative "
+            f"interfaces and rolling out a consistent HTTP security-header baseline "
+            f"would deliver the greatest reduction in residual risk for the least effort."
+        )
+    paras.append(impact + " " + bottom)
+    return paras
+
+
+def _join_list(items: List[str]) -> str:
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _build_exec_summary(story, data, content_w, st, client_name, report_date):
+    _section_header(story, st, "Section 01", "Executive Summary", content_w)
+
+    for para in _narrative_paragraphs(data, client_name, report_date):
+        story.append(Paragraph(para, st["body"]))
+
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("Assessment At a Glance", st["h2"]))
+    story.append(HRule(content_w, thickness=1.2, color=HAIRLINE))
+    story.append(Spacer(1, 7))
+    story.append(_kpi_cards(data, content_w, st))
+    story.append(Spacer(1, 8))
+
+    # Compact key-observations callout strip.
+    n_interesting = sum(1 for a in data["assets"]
+                        if _is_interesting_asset(getattr(a, "identifier", "")))
+    notes = []
+    if len(data["expiring"]):
+        notes.append(f"{len(data['expiring'])} cert(s) expiring &lt;30d")
+    if data["cert_stats"].get("expired", 0):
+        notes.append(f"{data['cert_stats']['expired']} expired cert(s)")
+    if data["cert_stats"].get("self_signed", 0):
+        notes.append(f"{data['cert_stats']['self_signed']} self-signed cert(s)")
     if data["ep_stats"].get("api_endpoints", 0):
-        notes.append(f"{data['ep_stats']['api_endpoints']} API endpoint(s) discovered")
+        notes.append(f"{data['ep_stats']['api_endpoints']:,} API endpoint(s)")
     if n_interesting:
         notes.append(f"{n_interesting} high-interest subdomain(s)")
     if notes:
-        story.append(Spacer(1, 6))
-        story.append(Paragraph(
-            "<b>Key observations:</b> " + "  •  ".join(notes), st["muted"]))
+        callout = Table(
+            [[Paragraph("<b>KEY SIGNALS</b>&nbsp;&nbsp;" + "&nbsp;&nbsp;•&nbsp;&nbsp;".join(notes),
+                        ParagraphStyle("callout", fontName="Helvetica", fontSize=8.5,
+                                       leading=12, textColor=INK))]],
+            colWidths=[content_w])
+        callout.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
+            ("LINEBEFORE", (0, 0), (0, -1), 3, ACCENT),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        story.append(callout)
 
 
 # --- Risk overview ----------------------------------------------------------
@@ -772,11 +1037,18 @@ def _build_endpoints(story, data, content_w, st):
             story.append(g)
             story.append(Spacer(1, 8))
 
-    # Notable endpoints: API + sensitive, de-duplicated
+    # Notable endpoints: API + sensitive. De-duplicate by (method, path without
+    # query) so a dozen near-identical "…/login.php?redirect=…" rows collapse to
+    # one representative entry — the table then shows genuine variety.
+    def _path_key(ep):
+        url = _s(getattr(ep, "url", None), "")
+        base = url.split("?", 1)[0]
+        return (getattr(ep, "method", None), base.rstrip("/"))
+
     notable = []
     seen = set()
-    for ep in list(data["api_endpoints"]) + list(data["sensitive_endpoints"]):
-        key = (getattr(ep, "url", None), getattr(ep, "method", None))
+    for ep in list(data["sensitive_endpoints"]) + list(data["api_endpoints"]):
+        key = _path_key(ep)
         if key in seen:
             continue
         seen.add(key)
@@ -797,7 +1069,7 @@ def _build_endpoints(story, data, content_w, st):
               Paragraph("API", st["cell_head"]),
               Paragraph("Status", st["cell_head_r"])]
     rows = [header]
-    shown = notable[:25]
+    shown = notable[:26]
     for ep in shown:
         rows.append([
             Paragraph(_s(getattr(ep, "method", None)), st["cell"]),
@@ -814,6 +1086,45 @@ def _build_endpoints(story, data, content_w, st):
         story.append(Spacer(1, 4))
         story.append(Paragraph(
             f"…and {len(notable) - len(shown)} more notable endpoint(s).", st["muted"]))
+
+
+_IMPLICATIONS = (
+    (("missing security headers", "x-frame", "clickjack"),
+     "Allows framing/clickjacking and reduces browser-side hardening."),
+    (("strict-transport", "hsts"),
+     "Without HSTS, users can be downgraded to plaintext HTTP via a man-in-the-middle."),
+    (("content security policy", "csp"),
+     "A weak CSP makes cross-site scripting and content injection easier to exploit."),
+    (("samesite", "cookie"),
+     "Cookies without SameSite weaken protection against cross-site request forgery."),
+    (("subresource integrity",),
+     "Third-party scripts can be tampered with if their integrity is not pinned."),
+    (("xss-protection", "cross-site scripting"),
+     "Legacy XSS filtering is not enforced, marginally raising reflected-XSS risk."),
+    (("https to http", "redirect"),
+     "A secure page redirecting to plaintext exposes traffic to interception."),
+    (("osticket", "ticket", "helpdesk"),
+     "A public support-portal login broadens the credential-attack surface."),
+    (("plesk", "cpanel", "webmin", "phpmyadmin"),
+     "An exposed hosting/admin panel is a prime target for brute-force and known CVEs."),
+    (("login panel", "admin panel"),
+     "A publicly reachable admin login invites credential-stuffing attempts."),
+    (("cve-", "rce", "remote code"),
+     "May permit code execution or unauthorised access; validate and patch promptly."),
+    (("open redirect",),
+     "Can be abused for phishing and to bypass allow-list based controls."),
+    (("directory listing", "listable"),
+     "Exposes file/directory structure that can aid further attacks."),
+)
+
+
+def _finding_implication(name: str, cve: Optional[str]) -> str:
+    """One-line, plain-language 'what it means' for a finding."""
+    text = (name or "").lower() + " " + (cve or "").lower()
+    for keywords, meaning in _IMPLICATIONS:
+        if any(k in text for k in keywords):
+            return meaning
+    return "Represents an exposure that expands the attack surface; review and harden."
 
 
 # --- Findings ---------------------------------------------------------------
@@ -848,52 +1159,72 @@ def _build_findings(story, data, content_w, st):
         group = grouped.get(sev, [])
         if not group:
             continue
-        block = []
-        chip = _sev_chip(sev, st)
-        heading = Table(
-            [[chip, Paragraph(f"<b>{sev.capitalize()} severity</b> "
-                              f'<font color="#5A6B7B">({len(group)})</font>',
-                              ParagraphStyle("gh", fontName="Helvetica-Bold",
-                                             fontSize=10.5, textColor=PRIMARY,
-                                             leading=14))]],
-            colWidths=[58, content_w - 58])
-        heading.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        block.append(heading)
 
-        header = [Paragraph("Finding", st["cell_head"]),
+        sev_color = SEV_COLORS[sev]
+        # Row 0: severity band (spans all columns, acts as chip + heading).
+        band = Paragraph(
+            f'<font color="#FFFFFF"><b>{sev.upper()} SEVERITY</b>'
+            f'&nbsp;&nbsp;&nbsp;({len(group)})</font>',
+            ParagraphStyle("sevband", fontName="Helvetica-Bold", fontSize=9.5,
+                           leading=13, textColor=LIGHT))
+        # Row 1: column headers.
+        header = [Paragraph("Finding &amp; what it means", st["cell_head"]),
                   Paragraph("Affected Host / URL", st["cell_head"]),
                   Paragraph("CVE / Template", st["cell_head"]),
                   Paragraph("CVSS", st["cell_head_r"])]
-        rows = [header]
+        rows = [[band, "", "", ""], header]
         for f in group[:PER_SEV_CAP]:
             name = _s(getattr(f, "name", None))
             host = _s(getattr(f, "host", None) or getattr(f, "matched_at", None))
-            ref = _s(getattr(f, "cve_id", None) or getattr(f, "template_id", None))
+            cve = getattr(f, "cve_id", None)
+            ref = _s(cve or getattr(f, "template_id", None))
             cvss = getattr(f, "cvss_score", None)
             cvss_disp = f"{cvss:.1f}" if isinstance(cvss, (int, float)) else "—"
+            implication = _finding_implication(name, cve)
+            # First cell: bold name + muted "what it means" sub-line.
+            name_cell = [
+                Paragraph(_clip(name, 58), st["finding_name"]),
+                Paragraph(_clip(implication, 92), st["finding_impl"]),
+            ]
             rows.append([
-                Paragraph(_clip(name, 52), st["finding_name"]),
-                Paragraph(_clip(host, 46), st["cell"]),
+                name_cell,
+                Paragraph(_clip(host, 44), st["cell"]),
                 Paragraph(_clip(ref, 30), st["cell"]),
                 Paragraph(cvss_disp, st["cell_r"]),
             ])
-        widths = [content_w * x for x in (0.36, 0.32, 0.23, 0.09)]
-        tbl = Table(rows, colWidths=widths, repeatRows=1)
-        tstyle = _std_table_style(4)
-        tstyle.add("LINEBEFORE", (0, 1), (0, -1), 2.5, SEV_COLORS[sev])
+        widths = [content_w * x for x in (0.42, 0.28, 0.21, 0.09)]
+        # repeatRows=2 -> the severity band AND column headers repeat if the
+        # table splits across a page boundary, so a large group flows naturally
+        # instead of jumping wholesale to the next page (no stranded whitespace).
+        tbl = Table(rows, colWidths=widths, repeatRows=2)
+        tstyle = TableStyle([
+            # Severity band row.
+            ("SPAN", (0, 0), (-1, 0)),
+            ("BACKGROUND", (0, 0), (-1, 0), sev_color),
+            ("TOPPADDING", (0, 0), (-1, 0), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
+            # Column-header row.
+            ("BACKGROUND", (0, 1), (-1, 1), PRIMARY),
+            ("TEXTCOLOR", (0, 1), (-1, 1), LIGHT),
+            # Body.
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("VALIGN", (0, 2), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 2), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 2), (-1, -1), 6),
+            ("ROWBACKGROUNDS", (0, 2), (-1, -1), [LIGHT, ZEBRA]),
+            ("LINEBELOW", (0, 2), (-1, -2), 0.4, HAIRLINE),
+            ("LINEBELOW", (0, -1), (-1, -1), 0.6, HAIRLINE),
+            ("LINEBEFORE", (0, 2), (0, -1), 2.5, sev_color),
+        ])
         tbl.setStyle(tstyle)
-        block.append(tbl)
+        story.append(tbl)
         if len(group) > PER_SEV_CAP:
-            block.append(Spacer(1, 3))
-            block.append(Paragraph(
+            story.append(Spacer(1, 3))
+            story.append(Paragraph(
                 f"…and {len(group) - PER_SEV_CAP} more {sev} finding(s).", st["muted"]))
-        block.append(Spacer(1, 8))
-        story.append(KeepTogether(block))
+        story.append(Spacer(1, 10))
 
 
 # --- Recommendations --------------------------------------------------------
@@ -1017,6 +1348,94 @@ def _build_recommendations(story, data, content_w, st):
         ("LINEBELOW", (0, 0), (-1, -2), 0.4, HAIRLINE),
     ]))
     story.append(tbl)
+
+
+# --- Methodology & severity scale ------------------------------------------
+def _build_methodology(story, data, content_w, st):
+    _section_header(story, st, "Section 08", "Methodology &amp; Severity Scale", content_w)
+
+    story.append(Paragraph(
+        "This assessment was conducted entirely from an external, unauthenticated "
+        "perspective — the vantage point of an internet-based attacker with no prior "
+        "access. No exploitation, denial-of-service or intrusive testing was performed; "
+        "the objective was to enumerate and characterise the exposed attack surface, not "
+        "to compromise it. The engagement followed a repeatable, tool-assisted workflow:",
+        st["body"]))
+
+    phases = [
+        ("1 · Discovery",
+         "Passive OSINT and active enumeration (DNS, certificate transparency, subdomain "
+         "brute-forcing) to establish the organisation's internet-facing footprint."),
+        ("2 · Enrichment",
+         "Port and service scanning, HTTP fingerprinting and TLS inspection to profile "
+         "each live host, its technology stack and its cryptographic posture."),
+        ("3 · Crawling",
+         "Web crawling of responsive hosts to map endpoints, forms and API surfaces that "
+         "expand the exploitable surface area."),
+        ("4 · Vulnerability scanning",
+         "Template-based scanning (Nuclei) plus rule-based checks to surface known "
+         "vulnerabilities, misconfigurations and information exposures."),
+        ("5 · Analysis & reporting",
+         "Manual triage, de-duplication and business-context prioritisation of results "
+         "into the findings and recommendations presented in this report."),
+    ]
+    rows = []
+    for title, desc in phases:
+        rows.append([
+            Paragraph(f"<b>{title}</b>", ParagraphStyle(
+                "ph", fontName="Helvetica-Bold", fontSize=8.5, leading=11,
+                textColor=PRIMARY)),
+            Paragraph(desc, st["cell"]),
+        ])
+    ptbl = Table(rows, colWidths=[content_w * 0.26, content_w * 0.74])
+    ptbl.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LINEBEFORE", (0, 0), (0, -1), 2.5, ACCENT),
+        ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [CARD_BG, LIGHT]),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (0, -1), 10),
+        ("LEFTPADDING", (1, 0), (1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, HAIRLINE),
+    ]))
+    story.append(ptbl)
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Severity Scale", st["h2"]))
+    story.append(HRule(content_w, thickness=1.2, color=HAIRLINE))
+    story.append(Spacer(1, 6))
+
+    scale = {
+        "critical": ("9.0 – 10.0", "Trivially exploitable, high impact — remediate immediately."),
+        "high": ("7.0 – 8.9", "Readily exploitable or high impact — remediate within days."),
+        "medium": ("4.0 – 6.9", "Exploitable under conditions — schedule remediation."),
+        "low": ("0.1 – 3.9", "Limited impact — address during routine maintenance."),
+        "info": ("N/A", "Informational / hardening opportunity — no direct vulnerability."),
+    }
+    header = [Paragraph("Severity", st["cell_head"]),
+              Paragraph("CVSS Band", st["cell_head"]),
+              Paragraph("Meaning &amp; Expected Response", st["cell_head"])]
+    srows = [header]
+    for sev in SEV_ORDER:
+        band, meaning = scale[sev]
+        srows.append([_sev_chip(sev, st),
+                      Paragraph(band, st["cell"]),
+                      Paragraph(meaning, st["cell"])])
+    stbl = Table(srows, colWidths=[content_w * 0.16, content_w * 0.20, content_w * 0.64],
+                 repeatRows=1)
+    stbl.setStyle(_std_table_style(3))
+    story.append(stbl)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(
+        "<b>Important note.</b> The results in this report reflect the external attack "
+        "surface at the time of testing. Internet-facing infrastructure changes "
+        "continuously; new assets, services and vulnerabilities can appear at any time. "
+        "This assessment should therefore be treated as a point-in-time snapshot and "
+        "repeated on a regular cadence to sustain assurance over the organisation's "
+        "security posture.", st["muted"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1205,19 +1624,24 @@ def generate_scan_report(db, tenant_id: int, prepared_by: str = "Security Team")
     story.append(PageBreak())
 
     # ---- Content sections ----
-    _build_exec_summary(story, data, content_w, st, client_name)
-    story.append(PageBreak())
+    # Sections flow continuously (no forced page breaks between them) so pages
+    # stay dense and there is no half-empty whitespace; ReportLab paginates only
+    # when a frame genuinely fills. A couple of spacers add breathing room.
+    _build_exec_summary(story, data, content_w, st, client_name, report_date)
+    story.append(Spacer(1, 12))
     _build_risk_overview(story, data, content_w, st)
-    story.append(PageBreak())
+    story.append(Spacer(1, 12))
     _build_inventory(story, data, content_w, st)
-    story.append(PageBreak())
+    story.append(Spacer(1, 12))
     _build_certificates(story, data, content_w, st)
-    story.append(PageBreak())
+    story.append(Spacer(1, 12))
     _build_endpoints(story, data, content_w, st)
-    story.append(PageBreak())
+    story.append(Spacer(1, 12))
     _build_findings(story, data, content_w, st)
-    story.append(PageBreak())
+    story.append(Spacer(1, 12))
     _build_recommendations(story, data, content_w, st)
+    story.append(Spacer(1, 12))
+    _build_methodology(story, data, content_w, st)
 
     doc.build(story)
     return buf.getvalue()
