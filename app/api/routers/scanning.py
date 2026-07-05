@@ -22,7 +22,8 @@ router = APIRouter(prefix="/api/v1/tenants/{tenant_id}/scan", tags=["Scanning"])
 def trigger_nuclei_scan(
     tenant_id: int,
     asset_ids: Optional[List[int]] = Body(None, description="Specific asset IDs to scan (optional)"),
-    severity_levels: List[str] = Body(['critical', 'high', 'medium'], description="Severity levels to scan"),
+    scan_level: str = Body('standard', description="Scan level: quick | standard | deep"),
+    severity_levels: Optional[List[str]] = Body(None, description="Override severities (defaults from scan_level)"),
     template_paths: Optional[List[str]] = Body(None, description="Specific template paths (optional)"),
     db: Session = Depends(get_db),
     membership = Depends(verify_tenant_access)
@@ -46,14 +47,18 @@ def trigger_nuclei_scan(
             "asset_ids": [1, 2, 3]
         }
     """
-    logger.info(f"Triggering Nuclei scan for tenant {tenant_id} (asset_ids: {asset_ids}, severity: {severity_levels})")
+    if scan_level not in ('quick', 'standard', 'deep'):
+        scan_level = 'standard'
+    logger.info(f"Triggering Nuclei scan for tenant {tenant_id} (level: {scan_level}, asset_ids: {asset_ids})")
 
-    # Trigger async Nuclei scan task (note: task uses 'severity' parameter, not 'severity_levels')
+    # Trigger async Nuclei scan task. severity/templates default from scan_level
+    # when not explicitly provided (see SCAN_LEVELS in app.tasks.scanning).
     task = run_nuclei_scan.delay(
         tenant_id=tenant_id,
         asset_ids=asset_ids,
-        severity=severity_levels,  # Map severity_levels -> severity
-        templates=template_paths    # Map template_paths -> templates
+        severity=severity_levels,   # None -> level default
+        templates=template_paths,   # None -> level default
+        scan_level=scan_level
     )
 
     return TaskResponse(

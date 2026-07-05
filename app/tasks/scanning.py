@@ -15,6 +15,7 @@ import logging
 import asyncio
 from typing import List, Optional, Dict
 from datetime import datetime
+from urllib.parse import urlparse
 
 from app.celery_app import celery
 from app.models.database import Asset, FindingSeverity
@@ -27,13 +28,107 @@ from app.utils.logger import TenantLoggerAdapter
 logger = logging.getLogger(__name__)
 
 
+# Scan levels — each scales two dials together: how many targets get scanned,
+# and how many templates/severities run against them. Mirrors a real EASM
+# cadence: L1 (quick) is cheap and safe to run often; L2 (standard) is the
+# balanced everyday scan; L3 (deep) is the thorough, authorized-only assessment.
+SCAN_LEVELS = {
+    'quick': {
+        'severities': ['critical', 'high'],
+        'templates': ['http/cves/', 'http/exposed-panels/', 'http/misconfiguration/'],
+        'include_endpoints': False,   # base live URLs only
+        'endpoint_filter': None,
+        'live_crawl': False,
+        'max_targets': 50,
+    },
+    'standard': {
+        'severities': ['critical', 'high', 'medium'],
+        'templates': None,            # NucleiService default (the 6 http/ categories)
+        'include_endpoints': True,
+        'endpoint_filter': 'app',     # API/form/pages, skip static files & external
+        'live_crawl': True,
+        'max_targets': 300,
+    },
+    'deep': {
+        'severities': ['critical', 'high', 'medium', 'low', 'info'],
+        'templates': ['http/'],       # all HTTP templates incl. fuzzing/injection
+        'include_endpoints': True,
+        'endpoint_filter': 'all',     # everything on our domains (still skip external)
+        'live_crawl': True,
+        'max_targets': 1000,
+    },
+}
+
+# Endpoint types that are static assets (js/css/img) — dropped by the 'app' filter
+_STATIC_ENDPOINT_TYPES = {'file', 'external'}
+
+# File extensions skipped when scanning (static assets rarely match vuln templates)
+_SCAN_SKIP_EXT = (
+    '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
+    '.woff2', '.ttf', '.eot', '.map', '.pdf', '.zip', '.mp4', '.webp', '.avif',
+)
+
+
+def _select_endpoint_targets(db, asset_ids, filter_mode, tenant_logger):
+    """Pull scannable URLs from the Endpoint inventory (populated by run_katana).
+
+    filter_mode:
+      - 'app': APIs, forms and pages on our domains; skip static files & external
+      - 'all': everything on our domains (still skip external links)
+
+    API/form endpoints are returned first so they survive the per-level cap.
+    """
+    from app.repositories.endpoint_repository import EndpointRepository
+    er = EndpointRepository(db)
+    priority, normal = [], []
+    for aid in asset_ids:
+        try:
+            endpoints = er.get_by_asset(aid, limit=5000)
+        except Exception as e:
+            tenant_logger.warning(f"Failed to read endpoints for asset {aid}: {e}")
+            continue
+        for ep in endpoints:
+            if ep.is_external:
+                continue
+            etype = (ep.endpoint_type or '').lower()
+            if filter_mode == 'app' and etype in _STATIC_ENDPOINT_TYPES:
+                continue
+            url = ep.url or ''
+            if not url.startswith(('http://', 'https://')):
+                continue
+            if ep.is_api or etype == 'form':
+                priority.append(url)
+            else:
+                normal.append(url)
+    return list(dict.fromkeys(priority + normal))
+
+
+def _is_scannable_url(url, base_urls, filter_mode):
+    """Decide whether a freshly-crawled plain URL should be scanned.
+
+    Keeps only internal URLs (same host or a subdomain of a base host); the 'app'
+    filter additionally drops static-asset file extensions.
+    """
+    if not url.startswith(('http://', 'https://')):
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    base_hosts = {urlparse(b).hostname.lower() for b in base_urls if urlparse(b).hostname}
+    if not any(host == bh or host.endswith('.' + bh) for bh in base_hosts):
+        return False
+    if filter_mode == 'app' and parsed.path.lower().endswith(_SCAN_SKIP_EXT):
+        return False
+    return True
+
+
 @celery.task(name='app.tasks.scanning.run_nuclei_scan')
 def run_nuclei_scan(
     tenant_id: int,
     asset_ids: Optional[List[int]] = None,
     severity: Optional[List[str]] = None,
     templates: Optional[List[str]] = None,
-    rate_limit: int = 300
+    rate_limit: int = 300,
+    scan_level: str = 'standard'
 ):
     """
     Execute Nuclei vulnerability scan on assets
@@ -51,8 +146,11 @@ def run_nuclei_scan(
         tenant_id: Tenant ID
         asset_ids: Optional list of specific asset IDs to scan
         severity: Severity filter (critical, high, medium, low, info)
-        templates: Optional template paths/categories
+        templates: Optional template paths/categories (defaults from scan_level)
         rate_limit: Requests per second (default: 300)
+        scan_level: 'quick' | 'standard' | 'deep' (see SCAN_LEVELS). Controls how
+            many targets are scanned (base only vs + endpoint inventory) and the
+            default severities/templates. Explicit severity/templates override.
 
     Returns:
         Dict with scan results and statistics
@@ -62,9 +160,18 @@ def run_nuclei_scan(
     tenant_logger = TenantLoggerAdapter(logger, {'tenant_id': tenant_id})
 
     try:
+        # Resolve scan level -> defaults for severity/templates/target selection.
+        # Explicit severity/templates args still override the level defaults.
+        level_cfg = SCAN_LEVELS.get(scan_level, SCAN_LEVELS['standard'])
+        if severity is None:
+            severity = level_cfg['severities']
+        if templates is None:
+            templates = level_cfg['templates']
+
         tenant_logger.info(
-            f"Starting Nuclei scan (assets: {len(asset_ids) if asset_ids else 'all'}, "
-            f"severity: {severity}, templates: {templates})"
+            f"Starting Nuclei scan (level: {scan_level}, "
+            f"assets: {len(asset_ids) if asset_ids else 'all'}, "
+            f"severity: {severity}, templates: {templates or 'default'})"
         )
 
         # Get assets to scan
@@ -128,38 +235,67 @@ def run_nuclei_scan(
                 all_urls.append(url)
                 url_to_asset[url] = asset_id
 
-        tenant_logger.info(f"Scanning {len(all_urls)} URLs across {len(assets)} assets")
+        tenant_logger.info(f"Base: {len(all_urls)} live URLs across {len(assets)} assets")
 
-        # Step 1: Crawl URLs with Katana to discover endpoints with parameters
-        tenant_logger.info("Running Katana crawler to discover vulnerable endpoints...")
-        from app.utils.secure_executor import SecureToolExecutor
+        # Target set = base live URLs, plus (for standard/deep) the classified
+        # endpoints already discovered by Katana, plus a fresh crawl. This is the
+        # attack surface nuclei actually scans — see SCAN_LEVELS.
+        extra_targets = []
 
-        crawled_urls = []
-        for url in all_urls:
-            tenant_logger.debug(f"Crawling {url}...")
+        # Endpoints from the inventory (populated by enrichment run_katana).
+        # 'app' filter keeps APIs/forms/pages and drops static files & external
+        # links; 'all' keeps everything on our own domains.
+        if level_cfg['include_endpoints']:
+            endpoint_urls = _select_endpoint_targets(
+                db, [a.id for a in assets], level_cfg['endpoint_filter'], tenant_logger
+            )
+            extra_targets.extend(endpoint_urls)
+            tenant_logger.info(f"Endpoint inventory contributed {len(endpoint_urls)} targets")
 
-            try:
-                with SecureToolExecutor(tenant_id) as executor:
-                    # Run Katana to discover endpoints
-                    returncode, stdout, stderr = executor.execute(
-                        'katana',
-                        ['-u', url, '-d', '2', '-jc', '-silent'],
-                        timeout=300
-                    )
-
+        # Fresh Katana crawl for extra coverage (quick level skips this).
+        if level_cfg['live_crawl']:
+            from app.utils.secure_executor import SecureToolExecutor
+            crawled = []
+            for url in all_urls:
+                try:
+                    with SecureToolExecutor(tenant_id) as executor:
+                        returncode, stdout, stderr = executor.execute(
+                            'katana', ['-u', url, '-d', '2', '-jc', '-silent'], timeout=300
+                        )
                     if returncode == 0 and stdout:
-                        # Extract URLs with parameters
                         for line in stdout.strip().split('\n'):
-                            if line and '?' in line:  # Has query parameters
-                                crawled_urls.append(line.strip())
-                                tenant_logger.debug(f"Discovered: {line.strip()}")
-            except Exception as e:
-                tenant_logger.warning(f"Katana crawl failed for {url}: {e}")
-                continue
+                            line = line.strip()
+                            if not line or line in all_urls:
+                                continue
+                            # standard: keep app-looking endpoints; deep: keep all internal
+                            if _is_scannable_url(line, all_urls, level_cfg['endpoint_filter']):
+                                crawled.append(line)
+                except Exception as e:
+                    tenant_logger.warning(f"Katana crawl failed for {url}: {e}")
+                    continue
+            extra_targets.extend(crawled)
+            tenant_logger.info(f"Live crawl contributed {len(crawled)} targets")
 
-        # Combine base URLs + crawled URLs with parameters
-        scan_targets = list(set(all_urls + crawled_urls))
-        tenant_logger.info(f"Total scan targets: {len(scan_targets)} ({len(all_urls)} base + {len(crawled_urls)} crawled)")
+        # Combine, dedup, and cap to the level's budget (base URLs always kept).
+        seen = set(all_urls)
+        capped_extra = []
+        for u in extra_targets:
+            if u not in seen:
+                seen.add(u)
+                capped_extra.append(u)
+        max_extra = max(0, level_cfg['max_targets'] - len(all_urls))
+        if len(capped_extra) > max_extra:
+            tenant_logger.info(
+                f"Capping targets to level '{scan_level}' budget "
+                f"({level_cfg['max_targets']}); dropping {len(capped_extra) - max_extra}"
+            )
+            capped_extra = capped_extra[:max_extra]
+
+        scan_targets = list(dict.fromkeys(all_urls + capped_extra))
+        tenant_logger.info(
+            f"Total scan targets: {len(scan_targets)} "
+            f"({len(all_urls)} base + {len(capped_extra)} discovered) [level={scan_level}]"
+        )
 
         # Step 2: Execute Nuclei scan
         nuclei_service = NucleiService(tenant_id)
