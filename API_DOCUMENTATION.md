@@ -3,9 +3,9 @@
 ## Sprint 3 - Complete FastAPI Implementation
 
 **Version:** 3.0.0
-**Base URL:** `http://localhost:8000`
+**Base URL:** `http://localhost:18000` via Docker Compose (host port), or `http://localhost:8000` when running `uvicorn` directly. Examples below use `8000`; substitute `18000` if you started the stack with `make up` / `docker-compose up`.
 **API Prefix:** `/api/v1`
-**Documentation:** `http://localhost:8000/api/docs`
+**Documentation:** `<base-url>/api/docs` (Swagger UI), `/api/redoc`, `/api/openapi.json`
 
 ---
 
@@ -991,7 +991,7 @@ services:
   api:
     image: easm-api:latest
     ports:
-      - "8000:8000"
+      - "18000:8000"
     environment:
       - ENVIRONMENT=production
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}

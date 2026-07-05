@@ -2,17 +2,17 @@
 
 Multi-tenant EASM platform built around ProjectDiscovery tools for continuous security reconnaissance.
 
-## Sprint 1 Status: Core Infrastructure & Discovery Pipeline ✅
+## Features
 
-### Completed Features
-
-- ✅ Docker Compose environment (PostgreSQL, Redis, MinIO, API, Worker, Beat)
-- ✅ Complete database schema with multi-tenant isolation
-- ✅ Celery task queue with scheduler (Beat)
-- ✅ Discovery pipeline: Uncover → Subfinder + Amass (parallel) → DNSX
-- ✅ MinIO storage for raw tool outputs
-- ✅ Asset persistence with event tracking
-- ✅ Database migrations (Alembic)
+- Docker Compose environment (PostgreSQL, Redis, MinIO, API, Worker, Beat, UI)
+- Multi-tenant database schema with strict tenant isolation (Alembic migrations)
+- Celery task queue with a Beat scheduler for periodic scans
+- **Discovery pipeline**: Uncover → Subfinder + Amass (parallel) → merge/dedup → DNSX
+- **Enrichment pipeline**: HTTPx (tech fingerprint) → Naabu (ports) → TLSx (certs) → Katana (crawl)
+- **Vulnerability scanning**: Nuclei with per-tenant template management and risk scoring
+- FastAPI REST API with JWT auth and RBAC (`/api/v1`)
+- Vue 3 frontend
+- MinIO storage for raw tool outputs, all external tools sandboxed via `SecureToolExecutor`
 
 ## Quick Start
 
@@ -20,7 +20,7 @@ Multi-tenant EASM platform built around ProjectDiscovery tools for continuous se
 
 - Docker & Docker Compose
 - 8GB+ RAM recommended
-- Ports 5432, 6379, 8000, 9000, 9001 available
+- Host ports 15432, 16379, 18000, 13000, 9000, 9001 available
 
 ### Installation
 
@@ -42,9 +42,10 @@ Multi-tenant EASM platform built around ProjectDiscovery tools for continuous se
    docker-compose logs -f
    ```
 
-4. **Access services**
-   - API: http://localhost:8000
-   - API Docs: http://localhost:8000/docs
+4. **Access services** (host ports; see `docker-compose.yml`)
+   - API: http://localhost:18000
+   - API Docs: http://localhost:18000/api/docs
+   - Frontend UI: http://localhost:13000
    - MinIO Console: http://localhost:9001 (minioadmin/minioadmin123)
 
 ### Running Discovery
@@ -160,13 +161,15 @@ docker-compose exec worker pytest --cov=app tests/
 ```
 easm/
 ├── app/
-│   ├── models/         # Database models
-│   ├── tasks/          # Celery tasks
-│   ├── routers/        # API routers (Sprint 2)
-│   ├── utils/          # Utilities
+│   ├── models/         # SQLAlchemy models (database, enrichment, auth)
+│   ├── tasks/          # Celery tasks (discovery, enrichment, scanning)
+│   ├── api/            # FastAPI routers, schemas, dependencies
+│   ├── repositories/   # Data-access layer
+│   ├── services/       # Business logic (risk scoring, nuclei scanning)
+│   ├── utils/          # Utilities (secure_executor, storage, validators)
 │   ├── main.py         # FastAPI app
 │   ├── database.py     # DB connection
-│   └── celery_app.py   # Celery config
+│   └── celery_app.py   # Celery config + Beat schedule
 ├── alembic/            # Database migrations
 ├── tests/              # Unit tests
 ├── docker-compose.yml  # Services orchestration
@@ -271,20 +274,12 @@ INSERT INTO tenants (name, slug, contact_policy, created_at, updated_at)
 VALUES ('Acme Corp', 'acme', 'security@acme.com', NOW(), NOW());
 ```
 
-## Next Steps (Sprint 2)
-
-- [ ] HTTP enrichment (httpx)
-- [ ] Port scanning (naabu)
-- [ ] TLS intelligence (tlsx)
-- [ ] Web crawling (katana)
-- [ ] FastAPI authentication (JWT)
-- [ ] Multi-tenant API endpoints
-- [ ] Asset and service REST APIs
-
 ## Documentation
 
-- [CLAUDE.md](CLAUDE.md) - AI assistant guidance
-- [SPRINTS.md](SPRINTS.md) - Detailed sprint plans
+- [CLAUDE.md](CLAUDE.md) - Architecture overview and developer guidance
+- [API_DOCUMENTATION.md](API_DOCUMENTATION.md) - REST API reference
+- [TENANT_ISOLATION_ARCHITECTURE.md](TENANT_ISOLATION_ARCHITECTURE.md) - Multi-tenancy design
+- [SECURITY_QUICK_REFERENCE.md](SECURITY_QUICK_REFERENCE.md) - Secure-coding patterns
 - [easm.md](easm.md) - Original architecture design (Italian)
 
 ## License

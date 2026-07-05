@@ -1,4 +1,4 @@
-# Security Quick Reference - Sprint 2
+# Security Quick Reference
 
 ## Critical Security Patterns
 
@@ -65,22 +65,25 @@ async def admin_settings(
 
 ### 5. Always Filter by Tenant
 
-```python
-from app.security.multitenancy import TenantIsolation
+Tenant access is verified with the `verify_tenant_access` dependency in
+`app/api/dependencies.py` (use `require_tenant_permission("write")` for write ops).
+Add it to any tenant-scoped route so membership/permission is enforced before the handler runs.
 
-# In database queries
-def get_assets(tenant_id: int):
-    # ALWAYS filter by tenant_id
+```python
+from fastapi import Depends
+from app.api.dependencies import verify_tenant_access, get_db
+
+@router.get("/api/v1/tenants/{tenant_id}/assets")
+def list_assets(
+    tenant_id: int,
+    db = Depends(get_db),
+    membership = Depends(verify_tenant_access),  # 403 if user is not a member of tenant_id
+):
+    # ALWAYS also filter the query by tenant_id
     return db.query(Asset).filter(
         Asset.tenant_id == tenant_id,
-        Asset.is_active == True
+        Asset.is_active == True,
     ).all()
-
-# Verify tenant access
-TenantIsolation.verify_tenant_access(
-    user_tenant_id=current_user['tenant_id'],
-    resource_tenant_id=asset.tenant_id
-)
 ```
 
 ### 6. Never Log Sensitive Data
@@ -387,9 +390,9 @@ print(payload)
 - OWASP Python Security: https://github.com/OWASP/Python-Security
 
 ### Internal Documentation
-- Full requirements: `SPRINT_2_SECURITY_REQUIREMENTS.md`
-- Implementation summary: `SPRINT_2_SECURITY_IMPLEMENTATION_SUMMARY.md`
-- Deployment checklist: `DEPLOYMENT_CHECKLIST.md`
+- Multi-tenancy design: `TENANT_ISOLATION_ARCHITECTURE.md`
+- Architecture overview: `CLAUDE.md`
+- Secure execution: `app/utils/secure_executor.py`, tenant enforcement: `app/api/dependencies.py`
 
 ---
 
