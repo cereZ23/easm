@@ -302,15 +302,19 @@ class NucleiService:
             for template in templates:
                 args.extend(['-t', template])
         else:
-            # Default templates: Comprehensive coverage including fuzzing
-            # Rely on severity filter to limit scope
+            # Default templates: high-value categories, severity filter limits scope.
+            # NOTE: nuclei-templates v10+ reorganised everything under protocol
+            # directories (http/, ssl/, dns/, ...). The old flat paths (cves/,
+            # vulnerabilities/, ...) now contain 0 templates and cause nuclei to
+            # abort with "no templates provided for scan" -> every scan found 0.
+            # Use the http/ prefixed paths.
             args.extend([
-                '-t', 'cves/',                    # CVE vulnerabilities
-                '-t', 'vulnerabilities/',         # Generic vulnerabilities (includes SQL injection)
-                '-t', 'exposures/',               # Information disclosure
-                '-t', 'misconfiguration/',        # Misconfigurations
-                '-t', 'exposed-panels/',          # Admin panels
-                '-t', 'fuzzing/',                 # Fuzzing templates (SQL, XSS, etc.)
+                '-t', 'http/cves/',                    # CVE vulnerabilities
+                '-t', 'http/vulnerabilities/',         # Generic vulnerabilities (SQLi, etc.)
+                '-t', 'http/exposures/',               # Information disclosure
+                '-t', 'http/misconfiguration/',        # Misconfigurations
+                '-t', 'http/exposed-panels/',          # Admin panels
+                '-t', 'http/fuzzing/',                 # Fuzzing templates (SQL, XSS, etc.)
             ])
 
         # Exclude certain templates that may cause DoS or are too noisy

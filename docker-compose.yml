@@ -130,7 +130,10 @@ services:
       MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin123}
     volumes:
       - ./app:/app/app
-      - ./nuclei-templates:/root/nuclei-templates
+      # nuclei templates are baked into the worker image (Dockerfile.worker runs
+      # `nuclei -update-templates`). Do NOT bind-mount an empty ./nuclei-templates
+      # here — it masks the image's ~13k templates and makes every scan find 0.
+      - nuclei_templates:/root/nuclei-templates
     networks:
       - easm-network
 
@@ -163,6 +166,7 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  nuclei_templates:
 
 networks:
   easm-network:
