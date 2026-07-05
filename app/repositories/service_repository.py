@@ -13,7 +13,7 @@ Features:
 
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, cast, Text
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import json
@@ -326,14 +326,15 @@ class ServiceRepository:
         Returns:
             List of services using the technology
         """
-        # JSONB containment query for http_technologies
-        # For technologies field (text), we'd need to parse JSON
+        # http_technologies is a plain JSON column (not JSONB), so it does not
+        # support containment operators. Cast both columns to text and match
+        # case-insensitively — robust and avoids a schema/type migration.
         return self.db.query(Service).join(Service.asset).filter(
             and_(
                 Service.asset.has(tenant_id=tenant_id),
                 or_(
-                    Service.http_technologies.contains([technology]),
-                    Service.technologies.like(f'%{technology}%')
+                    cast(Service.http_technologies, Text).ilike(f'%{technology}%'),
+                    Service.technologies.ilike(f'%{technology}%')
                 )
             )
         ).all()

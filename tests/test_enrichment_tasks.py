@@ -304,7 +304,6 @@ class TestHTTPx:
         })
 
         mock_executor.execute.return_value = (0, httpx_output, "")
-        mock_executor.create_input_file.return_value = "/tmp/urls.txt"
 
         # Run HTTPx
         result = run_httpx(
@@ -312,8 +311,8 @@ class TestHTTPx:
             asset_ids=[mock_assets[0].id]  # critical.example.com
         )
 
-        # Verify executor was called correctly
-        mock_executor.create_input_file.assert_called_once()
+        # Verify executor was called correctly. URLs are passed to HTTPx via
+        # stdin (not an input file) to avoid the -l flag memory leak.
         mock_executor.execute.assert_called_once()
 
         # Verify httpx command arguments
@@ -321,6 +320,8 @@ class TestHTTPx:
         assert call_args[0][0] == 'httpx'
         assert '-json' in call_args[0][1]
         assert '-status-code' in call_args[0][1]
+        # URLs delivered via stdin_data
+        assert call_args.kwargs.get('stdin_data')
 
 
 # =============================================================================
@@ -567,10 +568,14 @@ class TestEnrichmentIntegration:
     """Test end-to-end enrichment workflows"""
 
     @patch('app.database.SessionLocal')
+    @patch('celery.chord')
     @patch('app.tasks.enrichment.chain')
-    @patch('app.tasks.enrichment.group')
-    def test_run_enrichment_pipeline_orchestration(self, mock_group, mock_chain, mock_session_local, db_session, mock_tenant, mock_assets):
-        """Test that enrichment pipeline orchestrates tools correctly"""
+    def test_run_enrichment_pipeline_orchestration(self, mock_chain, mock_chord, mock_session_local, db_session, mock_tenant, mock_assets):
+        """Test that enrichment pipeline orchestrates tools correctly.
+
+        The pipeline runs HTTPx + Naabu + TLSx in a chord, then a
+        chain(Katana -> Nuclei) as the chord callback.
+        """
         # Patch SessionLocal to return our test session
         mock_session_local.return_value = db_session
 
@@ -579,12 +584,12 @@ class TestEnrichmentIntegration:
             asset.last_enriched_at = datetime.utcnow() - timedelta(days=10)
         db_session.commit()
 
-        # Mock Celery primitives
-        mock_parallel = Mock()
-        mock_group.return_value = mock_parallel
-        mock_sequential = Mock()
-        mock_chain.return_value = mock_sequential
-        mock_sequential.apply_async.return_value = Mock(id='task-123')
+        # chord(parallel_tasks) returns a callable; calling it with the callback
+        # returns an AsyncResult carrying the task id.
+        mock_chord_header = Mock()
+        mock_chord.return_value = mock_chord_header
+        mock_chord_header.return_value = Mock(id='task-123')
+        mock_chain.return_value = Mock()
 
         result = run_enrichment_pipeline(
             tenant_id=mock_tenant.id,
@@ -593,14 +598,16 @@ class TestEnrichmentIntegration:
             force_refresh=False
         )
 
-        # Verify parallel group was created with HTTPx, Naabu, TLSx
-        mock_group.assert_called_once()
+        # Verify the parallel group (HTTPx, Naabu, TLSx) was wrapped in a chord
+        mock_chord.assert_called_once()
+        parallel_tasks = mock_chord.call_args[0][0]
+        assert len(parallel_tasks) == 3  # HTTPx + Naabu + TLSx
 
-        # Verify chain was created (parallel group → Katana)
+        # Verify chain was created (Katana -> Nuclei) as the chord callback
         mock_chain.assert_called_once()
 
-        # Verify pipeline was queued
-        mock_sequential.apply_async.assert_called_once()
+        # Verify the chord was invoked with the callback
+        mock_chord_header.assert_called_once()
 
         assert result['status'] == 'started'
         assert result['task_id'] == 'task-123'

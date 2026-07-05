@@ -141,7 +141,8 @@ async def add_process_time_header(request: Request, call_next):
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log all requests for monitoring"""
-    logger.info(f"{request.method} {request.url.path} - Client: {request.client.host}")
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(f"{request.method} {request.url.path} - Client: {client_host}")
     try:
         response = await call_next(request)
         logger.info(f"{request.method} {request.url.path} - Status: {response.status_code}")

@@ -355,7 +355,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not settings.rate_limit_enabled:
             return await call_next(request)
 
-        client_ip = request.client.host
+        client_ip = request.client.host if request.client else "unknown"
 
         # Check global rate limit
         is_allowed, remaining, reset_time = self.rate_limiter.check_rate_limit(

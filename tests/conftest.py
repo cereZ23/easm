@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 # Load environment variables from .env file for database connection
@@ -53,24 +53,30 @@ def pytest_configure(config):
 
 
 # Database Fixtures
-@pytest.fixture(scope='function')
+@pytest.fixture(scope='session')
 def db_engine():
-    """Create PostgreSQL database engine for testing
+    """Create the PostgreSQL engine for the whole test session.
 
-    Uses the PostgreSQL database from docker-compose.
-    Tests run in transactions that are rolled back for isolation.
+    Session-scoped so a single connection pool is shared across all tests —
+    a function-scoped engine would open a fresh pool per test and exhaust
+    Postgres max_connections on a large run. Per-test isolation is provided by
+    the function-scoped db_session fixture (SAVEPOINT + rollback), not by
+    recreating the engine.
+
+    Prefer an explicit TEST_DATABASE_URL; otherwise use the app's configured
+    database. settings.database_url reads POSTGRES_HOST/PORT from the
+    environment, so this resolves to postgres:5432 inside the compose network
+    (how `docker-compose exec worker pytest` / `make test` runs) and to the
+    localhost:15432 host mapping when run outside Docker.
     """
-    # Use the actual PostgreSQL database from docker-compose
-    # Connection string matches docker-compose.yml configuration
-    # Using 127.0.0.1 instead of localhost to force IPv4
-    # Read password from environment (set in .env file)
-    db_password = os.environ.get('DB_PASSWORD', 'easm_password')
-    database_url = os.environ.get(
-        'TEST_DATABASE_URL',
-        f'postgresql://easm:{db_password}@127.0.0.1:15432/easm'
-    )
+    from app.config import settings
+    database_url = os.environ.get('TEST_DATABASE_URL', settings.database_url)
 
-    engine = create_engine(database_url, echo=False)
+    # Bounded pool with overflow recycling keeps connection usage well under
+    # Postgres max_connections even under xdist.
+    engine = create_engine(
+        database_url, echo=False, pool_size=5, max_overflow=10, pool_pre_ping=True
+    )
 
     # Ensure all tables exist
     Base.metadata.create_all(engine)
@@ -81,20 +87,28 @@ def db_engine():
 
 @pytest.fixture(scope='function')
 def db_session(db_engine):
-    """Create database session with transaction rollback for test isolation"""
-    # Create a connection
-    connection = db_engine.connect()
+    """Create a fully-isolated database session for a test.
 
-    # Begin a transaction
+    Uses the "join an external transaction" pattern with SAVEPOINTs so that any
+    session.commit() inside a test or fixture only commits to a savepoint — the
+    outer transaction is always rolled back at teardown, leaving the database
+    untouched. This prevents committed fixture data (e.g. a 'test-tenant') from
+    leaking across tests and causing unique-constraint collisions.
+    """
+    connection = db_engine.connect()
     transaction = connection.begin()
 
-    # Create a session bound to the connection
-    SessionLocal = sessionmaker(bind=connection)
+    # join_transaction_mode="create_savepoint" (SQLAlchemy 2.0+) makes every
+    # session.commit() commit to a SAVEPOINT inside our outer transaction rather
+    # than to the real database. Rolling back the outer transaction at teardown
+    # then undoes everything the test/fixtures did — reliable isolation without
+    # a manual after_transaction_end listener.
+    SessionLocal = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
     session = SessionLocal()
 
     yield session
 
-    # Rollback the transaction to undo all changes
+    # Rollback the outer transaction to undo everything the test did
     session.close()
     transaction.rollback()
     connection.close()
@@ -666,7 +680,7 @@ def client(db_session):
 
     # Import app and database dependency
     try:
-        from app.api.main import app
+        from app.main import app
         from app.database import get_db
 
         # Override database dependency
@@ -708,32 +722,12 @@ def test_tenant(db_session):
 @pytest.fixture
 def test_user(db_session, test_tenant):
     """Create test user with hashed password"""
-    try:
-        from app.models.user import User
-    except ImportError:
-        # Create minimal User class if not exists
-        from sqlalchemy import Column, Integer, String, Boolean
-        class User(Base):
-            __tablename__ = 'users'
-            id = Column(Integer, primary_key=True)
-            email = Column(String, unique=True, nullable=False)
-            username = Column(String, unique=True, nullable=False)
-            hashed_password = Column(String, nullable=False)
-            is_active = Column(Boolean, default=True)
-            is_superuser = Column(Boolean, default=False)
-
-    try:
-        from app.security.auth import get_password_hash
-    except ImportError:
-        # Fallback password hash
-        import bcrypt
-        def get_password_hash(password: str) -> str:
-            return bcrypt.hashpw(password.encode(), bcrypt.gensalt(12)).decode()
+    from app.models.auth import User, TenantMembership
 
     user = User(
         email="test@example.com",
         username="testuser",
-        hashed_password=get_password_hash("password123"),
+        hashed_password=User.hash_password("password123"),
         is_active=True,
         is_superuser=False
     )
@@ -742,17 +736,13 @@ def test_user(db_session, test_tenant):
     db_session.refresh(user)
 
     # Create tenant membership
-    try:
-        from app.models.user import TenantMembership
-        membership = TenantMembership(
-            user_id=user.id,
-            tenant_id=test_tenant.id,
-            role="member"
-        )
-        db_session.add(membership)
-        db_session.commit()
-    except ImportError:
-        pass
+    membership = TenantMembership(
+        user_id=user.id,
+        tenant_id=test_tenant.id,
+        role="member"
+    )
+    db_session.add(membership)
+    db_session.commit()
 
     return user
 
@@ -760,30 +750,12 @@ def test_user(db_session, test_tenant):
 @pytest.fixture
 def admin_user(db_session, test_tenant):
     """Create admin user"""
-    try:
-        from app.models.user import User
-    except ImportError:
-        from sqlalchemy import Column, Integer, String, Boolean
-        class User(Base):
-            __tablename__ = 'users'
-            id = Column(Integer, primary_key=True)
-            email = Column(String, unique=True, nullable=False)
-            username = Column(String, unique=True, nullable=False)
-            hashed_password = Column(String, nullable=False)
-            is_active = Column(Boolean, default=True)
-            is_superuser = Column(Boolean, default=False)
-
-    try:
-        from app.security.auth import get_password_hash
-    except ImportError:
-        import bcrypt
-        def get_password_hash(password: str) -> str:
-            return bcrypt.hashpw(password.encode(), bcrypt.gensalt(12)).decode()
+    from app.models.auth import User, TenantMembership
 
     user = User(
         email="admin@example.com",
         username="admin",
-        hashed_password=get_password_hash("admin123"),
+        hashed_password=User.hash_password("admin123"),
         is_active=True,
         is_superuser=True
     )
@@ -792,17 +764,13 @@ def admin_user(db_session, test_tenant):
     db_session.refresh(user)
 
     # Create tenant membership with admin role
-    try:
-        from app.models.user import TenantMembership
-        membership = TenantMembership(
-            user_id=user.id,
-            tenant_id=test_tenant.id,
-            role="admin"
-        )
-        db_session.add(membership)
-        db_session.commit()
-    except ImportError:
-        pass
+    membership = TenantMembership(
+        user_id=user.id,
+        tenant_id=test_tenant.id,
+        role="admin"
+    )
+    db_session.add(membership)
+    db_session.commit()
 
     return user
 
@@ -899,7 +867,7 @@ def other_tenant(db_session):
 def other_tenant_user(db_session, other_tenant):
     """Create user belonging to other tenant"""
     try:
-        from app.models.user import User, TenantMembership
+        from app.models.auth import User, TenantMembership
     except ImportError:
         return None
 
@@ -1069,7 +1037,6 @@ def test_findings(db_session, test_assets):
     findings = [
         Finding(
             asset_id=test_assets[2].id,  # api.example.com
-            tenant_id=test_assets[2].tenant_id,
             source="nuclei",
             template_id="CVE-2021-44228",
             name="Apache Log4j RCE",
@@ -1081,7 +1048,6 @@ def test_findings(db_session, test_assets):
         ),
         Finding(
             asset_id=test_assets[4].id,  # login URL
-            tenant_id=test_assets[4].tenant_id,
             source="nuclei",
             template_id="exposed-panels/login-panel",
             name="Exposed Login Panel",
@@ -1092,7 +1058,6 @@ def test_findings(db_session, test_assets):
         ),
         Finding(
             asset_id=test_assets[1].id,  # www.example.com
-            tenant_id=test_assets[1].tenant_id,
             source="nuclei",
             template_id="http-missing-security-headers",
             name="Missing Security Headers",
@@ -1127,7 +1092,6 @@ def sample_finding(db_session, sample_asset):
     """Create a sample finding"""
     finding = Finding(
         asset_id=sample_asset.id,
-        tenant_id=sample_asset.tenant_id,
         source="nuclei",
         template_id="CVE-2021-12345",
         name="Test Vulnerability",
@@ -1242,7 +1206,6 @@ def test_finding(db_session, test_asset):
     """Create single test finding"""
     finding = Finding(
         asset_id=test_asset.id,
-        tenant_id=test_asset.tenant_id,
         source="nuclei",
         template_id="CVE-2023-12345",
         name="Test Vulnerability",
@@ -1315,7 +1278,6 @@ def other_tenant_finding(db_session, other_tenant_asset):
     """Create finding for other tenant"""
     finding = Finding(
         asset_id=other_tenant_asset.id,
-        tenant_id=other_tenant_asset.tenant_id,
         source="nuclei",
         template_id="CVE-2023-99999",
         name="Other Tenant Vulnerability",
@@ -1398,7 +1360,6 @@ def existing_finding(db_session, test_asset):
     from datetime import datetime, timedelta
     finding = Finding(
         asset_id=test_asset.id,
-        tenant_id=test_asset.tenant_id,
         source="nuclei",
         template_id="CVE-2023-00001",
         name="Existing Vulnerability",
