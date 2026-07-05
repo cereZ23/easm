@@ -83,8 +83,7 @@ class Certificate(Base):
     raw_data = Column(JSON)  # Full TLSx output for debugging
 
     # Relationship
-    # TODO: Re-enable after fixing circular import
-    # asset = relationship("Asset", back_populates="certificates")
+    asset = relationship("Asset", back_populates="certificates")
 
     __table_args__ = (
         Index('idx_asset_cert', 'asset_id'),
@@ -160,8 +159,7 @@ class Endpoint(Base):
     raw_data = Column(JSON)  # Full Katana output
 
     # Relationship
-    # TODO: Re-enable after fixing circular import
-    # asset = relationship("Asset", back_populates="endpoints")
+    asset = relationship("Asset", back_populates="endpoints")
 
     __table_args__ = (
         Index('idx_asset_endpoint', 'asset_id'),

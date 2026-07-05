@@ -25,6 +25,15 @@ from app.models.auth import (
     APIKey,
 )
 
+# Enrichment models must be imported here so their mappers are registered
+# before SQLAlchemy resolves the string-based Asset.certificates /
+# Asset.endpoints relationships.
+from app.models.enrichment import (
+    Certificate,
+    Endpoint,
+    AssetPriority,
+)
+
 __all__ = [
     'Base',
     'Tenant',
@@ -40,4 +49,7 @@ __all__ = [
     'User',
     'TenantMembership',
     'APIKey',
+    'Certificate',
+    'Endpoint',
+    'AssetPriority',
 ]
