@@ -18,7 +18,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from app.celery_app import celery
-from app.models.database import Asset, FindingSeverity
+from app.models.database import Asset, AssetType, FindingSeverity
 from app.services.scanning.nuclei_service import NucleiService, calculate_risk_score_from_findings
 from app.services.scanning.suppression_service import SuppressionService
 from app.repositories.finding_repository import FindingRepository
@@ -202,27 +202,30 @@ def run_nuclei_scan(
         urls_by_asset = {}
 
         for asset in assets:
-            # Get web services for this asset
-            web_services = service_repo.get_web_services(asset.id, only_live=True)
-
-            for service in web_services:
-                # Build URL from service
-                scheme = service.protocol or ('https' if service.has_tls else 'http')
-                port = service.port
-
-                # Construct URL
-                if port in [80, 443]:
-                    url = f"{scheme}://{asset.identifier}"
+            urls = []
+            # Use ALL web services (not only httpx-live) — naabu-discovered ports
+            # count too, and httpx coverage is often incomplete (a host it missed
+            # must still be scanned).
+            for service in service_repo.get_web_services(asset.id, only_live=False):
+                # Derive scheme from port/TLS — NOT service.protocol (naabu records
+                # 'tcp', which is not a valid URL scheme for nuclei/httpx).
+                scheme = 'https' if (service.has_tls or service.port in (443, 8443)) else 'http'
+                if service.port in (80, 443):
+                    urls.append(f"{scheme}://{asset.identifier}")
                 else:
-                    url = f"{scheme}://{asset.identifier}:{port}"
+                    urls.append(f"{scheme}://{asset.identifier}:{service.port}")
 
-                if asset.id not in urls_by_asset:
-                    urls_by_asset[asset.id] = []
+            # Fallback: a domain/subdomain with no recorded web service still gets
+            # probed on the standard web URLs (nuclei handles unreachable hosts).
+            if not urls and asset.type in (AssetType.DOMAIN, AssetType.SUBDOMAIN):
+                urls.append(f"https://{asset.identifier}")
+                urls.append(f"http://{asset.identifier}")
 
-                urls_by_asset[asset.id].append(url)
+            if urls:
+                urls_by_asset[asset.id] = list(dict.fromkeys(urls))
 
         if not urls_by_asset:
-            tenant_logger.warning("No live web services found for scanning")
+            tenant_logger.warning("No web-capable assets to scan")
             return {
                 'assets_scanned': len(assets),
                 'findings_created': 0,

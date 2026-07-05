@@ -167,7 +167,7 @@ class Finding(Base):
         Index('idx_template_id', 'template_id'),
         Index('idx_cve_id', 'cve_id'),
         # Sprint 3: Deduplication index (asset_id, template_id, matcher_name)
-        Index('idx_finding_dedup', 'asset_id', 'template_id', 'matcher_name'),
+        Index('idx_finding_dedup', 'asset_id', 'template_id', 'matcher_name', unique=True),
     )
 
     def __repr__(self):

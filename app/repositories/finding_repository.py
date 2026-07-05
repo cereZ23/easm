@@ -218,6 +218,19 @@ class FindingRepository:
                 errors.append(f"Finding {idx}: {str(e)}")
                 continue
 
+        # Deduplicate within the batch by the conflict key
+        # (asset_id, template_id, matcher_name). With the NULLS NOT DISTINCT
+        # unique index the DB treats null matchers as equal, so two rows sharing
+        # that key in a single INSERT raise a CardinalityViolation ("ON CONFLICT
+        # DO UPDATE command cannot affect row a second time"). Keep the last
+        # occurrence (nuclei often reports the same template at / and no-slash).
+        if records:
+            deduped = {}
+            for record in records:
+                key = (record['asset_id'], record['template_id'], record['matcher_name'])
+                deduped[key] = record
+            records = list(deduped.values())
+
         if not records:
             return {
                 'created': 0,
