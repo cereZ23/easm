@@ -8,8 +8,8 @@ Multi-tenant EASM platform built around ProjectDiscovery tools for continuous se
 - Multi-tenant database schema with strict tenant isolation (Alembic migrations)
 - Celery task queue with a Beat scheduler for periodic scans
 - **Discovery pipeline**: Uncover → Subfinder + Amass (parallel) → merge/dedup → DNSX
-- **Enrichment pipeline**: HTTPx (tech fingerprint) → Naabu (ports) → TLSx (certs) → Katana (crawl)
-- **Vulnerability scanning**: Nuclei with per-tenant template management and risk scoring
+- **Enrichment pipeline**: HTTPx (tech fingerprint) → Naabu (ports) → TLSx (certs) → Katana (crawl → endpoint inventory)
+- **Vulnerability scanning**: Katana crawl → Nuclei (per-tenant template management) → risk scoring
 - FastAPI REST API with JWT auth and RBAC (`/api/v1`)
 - Vue 3 frontend
 - MinIO storage for raw tool outputs, all external tools sandboxed via `SecureToolExecutor`

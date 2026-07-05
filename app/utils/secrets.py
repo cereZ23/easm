@@ -42,9 +42,16 @@ class SecretManager:
         self.key_file = key_file
         self._cache: Dict[str, str] = {}
         self._fernet: Optional[Fernet] = None
+        self._client = None  # backend-specific client (vault/aws/azure)
 
         if backend == 'file':
             self._initialize_file_backend()
+        elif backend == 'vault':
+            self._initialize_vault_backend()
+        elif backend == 'aws':
+            self._initialize_aws_backend()
+        elif backend == 'azure':
+            self._initialize_azure_backend()
 
     def _initialize_file_backend(self):
         """Initialize file-based encrypted secret storage"""
@@ -98,13 +105,14 @@ class SecretManager:
             elif self.backend == 'file':
                 return self._get_from_file(key, default)
 
-            # Placeholder for other backends
-            # elif self.backend == 'vault':
-            #     return self._get_from_vault(key, default)
-            # elif self.backend == 'azure':
-            #     return self._get_from_azure(key, default)
-            # elif self.backend == 'aws':
-            #     return self._get_from_aws(key, default)
+            elif self.backend == 'vault':
+                return self._get_from_vault(key, default)
+
+            elif self.backend == 'aws':
+                return self._get_from_aws(key, default)
+
+            elif self.backend == 'azure':
+                return self._get_from_azure(key, default)
 
             else:
                 logger.warning(f"Unknown backend: {self.backend}, falling back to env")
@@ -139,6 +147,168 @@ class SecretManager:
             logger.error(f"Failed to read secret from file: {e}")
             return default
 
+    # ------------------------------------------------------------------
+    # HashiCorp Vault backend (KV v2)
+    # ------------------------------------------------------------------
+    def _initialize_vault_backend(self):
+        """
+        Initialize a HashiCorp Vault client.
+
+        Config (env vars):
+            VAULT_ADDR        Vault server URL (required)
+            VAULT_TOKEN       Auth token (required)
+            VAULT_SECRET_PATH KV v2 path holding EASM secrets
+                              (default 'easm', under mount 'secret')
+            VAULT_MOUNT       KV v2 mount point (default 'secret')
+
+        Requires the 'hvac' package: pip install hvac
+        """
+        try:
+            import hvac
+        except ImportError as e:
+            raise ImportError(
+                "The 'hvac' package is required for the Vault backend. "
+                "Install it with: pip install hvac"
+            ) from e
+
+        addr = os.getenv('VAULT_ADDR')
+        token = os.getenv('VAULT_TOKEN')
+        if not addr or not token:
+            raise ValueError("VAULT_ADDR and VAULT_TOKEN must be set for the Vault backend")
+
+        self._vault_mount = os.getenv('VAULT_MOUNT', 'secret')
+        self._vault_path = os.getenv('VAULT_SECRET_PATH', 'easm')
+        self._client = hvac.Client(url=addr, token=token)
+
+        if not self._client.is_authenticated():
+            raise ValueError("Vault authentication failed (check VAULT_TOKEN)")
+
+    def _get_from_vault(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Read a key from the Vault KV v2 secret at VAULT_SECRET_PATH."""
+        try:
+            resp = self._client.secrets.kv.v2.read_secret_version(
+                path=self._vault_path,
+                mount_point=self._vault_mount,
+            )
+            data = resp['data']['data']
+            value = data.get(key, default)
+            if value is not None:
+                self._cache[key] = value
+            return value
+        except Exception as e:
+            logger.error(f"Failed to read secret {key} from Vault: {e}")
+            return default
+
+    # ------------------------------------------------------------------
+    # AWS Secrets Manager backend
+    # ------------------------------------------------------------------
+    def _initialize_aws_backend(self):
+        """
+        Initialize an AWS Secrets Manager client.
+
+        Config (env vars):
+            AWS_REGION / AWS_DEFAULT_REGION   Region (required)
+            AWS_SECRETS_BUNDLE                Optional name of a single secret
+                                              holding a JSON map of many keys.
+                                              If unset, each key is fetched as
+                                              its own secret by name.
+            Standard AWS credential env/IAM roles are used for auth.
+
+        Requires the 'boto3' package: pip install boto3
+        """
+        try:
+            import boto3
+        except ImportError as e:
+            raise ImportError(
+                "The 'boto3' package is required for the AWS backend. "
+                "Install it with: pip install boto3"
+            ) from e
+
+        region = os.getenv('AWS_REGION') or os.getenv('AWS_DEFAULT_REGION')
+        if not region:
+            raise ValueError("AWS_REGION (or AWS_DEFAULT_REGION) must be set for the AWS backend")
+
+        self._aws_bundle = os.getenv('AWS_SECRETS_BUNDLE')
+        self._client = boto3.client('secretsmanager', region_name=region)
+
+    def _get_from_aws(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        Read a key from AWS Secrets Manager.
+
+        If AWS_SECRETS_BUNDLE is set, that secret is parsed as JSON and the key
+        looked up inside it; otherwise the key is treated as a secret name.
+        """
+        try:
+            secret_name = self._aws_bundle or key
+            resp = self._client.get_secret_value(SecretId=secret_name)
+            raw = resp.get('SecretString')
+            if raw is None:
+                return default
+
+            if self._aws_bundle:
+                value = json.loads(raw).get(key, default)
+            else:
+                # A single-value secret may be raw or a {key: value} JSON blob
+                try:
+                    parsed = json.loads(raw)
+                    value = parsed.get(key, raw) if isinstance(parsed, dict) else raw
+                except json.JSONDecodeError:
+                    value = raw
+
+            if value is not None:
+                self._cache[key] = value
+            return value
+        except Exception as e:
+            logger.error(f"Failed to read secret {key} from AWS Secrets Manager: {e}")
+            return default
+
+    # ------------------------------------------------------------------
+    # Azure Key Vault backend
+    # ------------------------------------------------------------------
+    def _initialize_azure_backend(self):
+        """
+        Initialize an Azure Key Vault client using DefaultAzureCredential.
+
+        Config (env vars):
+            AZURE_KEY_VAULT_URL   Vault URL, e.g. https://myvault.vault.azure.net/
+            Standard Azure credential env vars / managed identity are used.
+
+        Requires: pip install azure-identity azure-keyvault-secrets
+        """
+        try:
+            from azure.identity import DefaultAzureCredential
+            from azure.keyvault.secrets import SecretClient
+        except ImportError as e:
+            raise ImportError(
+                "The 'azure-identity' and 'azure-keyvault-secrets' packages are "
+                "required for the Azure backend. Install them with: "
+                "pip install azure-identity azure-keyvault-secrets"
+            ) from e
+
+        vault_url = os.getenv('AZURE_KEY_VAULT_URL')
+        if not vault_url:
+            raise ValueError("AZURE_KEY_VAULT_URL must be set for the Azure backend")
+
+        credential = DefaultAzureCredential()
+        self._client = SecretClient(vault_url=vault_url, credential=credential)
+
+    @staticmethod
+    def _azure_secret_name(key: str) -> str:
+        """Azure secret names allow only alphanumerics and dashes."""
+        return key.replace('_', '-').lower()
+
+    def _get_from_azure(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Read a secret from Azure Key Vault (underscores mapped to dashes)."""
+        try:
+            secret = self._client.get_secret(self._azure_secret_name(key))
+            value = secret.value if secret else default
+            if value is not None:
+                self._cache[key] = value
+            return value
+        except Exception as e:
+            logger.error(f"Failed to read secret {key} from Azure Key Vault: {e}")
+            return default
+
     def set_secret(self, key: str, value: str):
         """
         Store a secret
@@ -153,6 +323,27 @@ class SecretManager:
 
         elif self.backend == 'file':
             self._set_to_file(key, value)
+
+        elif self.backend == 'vault':
+            self._client.secrets.kv.v2.create_or_update_secret(
+                path=self._vault_path,
+                mount_point=self._vault_mount,
+                secret={key: value},
+            )
+            self._cache[key] = value
+
+        elif self.backend == 'aws':
+            secret_name = self._aws_bundle or key
+            payload = json.dumps({key: value}) if self._aws_bundle else value
+            try:
+                self._client.put_secret_value(SecretId=secret_name, SecretString=payload)
+            except self._client.exceptions.ResourceNotFoundException:
+                self._client.create_secret(Name=secret_name, SecretString=payload)
+            self._cache[key] = value
+
+        elif self.backend == 'azure':
+            self._client.set_secret(self._azure_secret_name(key), value)
+            self._cache[key] = value
 
         # Log audit event (without the actual secret)
         logger.info(f"Secret {key} was updated at {datetime.utcnow().isoformat()}")

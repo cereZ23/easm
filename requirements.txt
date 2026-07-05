@@ -52,3 +52,13 @@ cryptography==41.0.7  # Secret encryption (Sprint 2 security fix)
 
 # Monitoring and Error Tracking
 sentry-sdk[celery,sqlalchemy]==1.40.0
+
+# Optional secret backends (install only if SECRET_BACKEND is set accordingly).
+# The env/file backends work without these; they are lazily imported.
+#   SECRET_BACKEND=vault  ->  hvac
+#   SECRET_BACKEND=aws    ->  boto3
+#   SECRET_BACKEND=azure  ->  azure-identity, azure-keyvault-secrets
+# hvac==2.1.0
+# boto3==1.34.34
+# azure-identity==1.15.0
+# azure-keyvault-secrets==4.7.0

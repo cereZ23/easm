@@ -113,6 +113,18 @@ app.add_middleware(
     allow_headers=settings.cors_allow_headers,
 )
 
+# 3. Distributed rate limiting (Redis sliding-window, global + per-IP baseline).
+# Honors settings.rate_limit_enabled internally and fails open if Redis is down.
+if settings.rate_limit_enabled:
+    from app.core.rate_limiter import RateLimitMiddleware
+
+    app.add_middleware(
+        RateLimitMiddleware,
+        global_limit=settings.rate_limit_requests_per_minute * 100,
+        ip_limit=settings.rate_limit_requests_per_minute,
+        window=60,
+    )
+
 
 # Request timing middleware
 @app.middleware("http")

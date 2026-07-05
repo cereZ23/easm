@@ -1,9 +1,9 @@
 """
 Enrichment pipeline tasks for asset enrichment
 
-Sprint 2: Implements HTTP fingerprinting (HTTPx), port scanning (Naabu),
-TLS/SSL analysis (TLSx), and web crawling (Katana) with comprehensive
-security controls and tiered enrichment based on asset priority.
+Implements HTTP fingerprinting (HTTPx), port scanning (Naabu), TLS/SSL
+analysis (TLSx), and web crawling / endpoint discovery (Katana) with
+comprehensive security controls and tiered enrichment based on asset priority.
 
 Security Features:
 - Input validation (DomainValidator, URLValidator)
@@ -20,7 +20,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from app.celery_app import celery
 from app.models.database import Asset, AssetType
@@ -47,8 +47,8 @@ def run_enrichment_pipeline(
     """
     Run complete enrichment pipeline for assets
 
-    Orchestrates parallel execution of HTTPx + Naabu + TLSx,
-    followed by sequential Katana (which depends on HTTPx results).
+    Orchestrates parallel execution of HTTPx + Naabu + TLSx, then Katana
+    endpoint discovery, then Nuclei.
 
     Args:
         tenant_id: Tenant ID
@@ -61,7 +61,8 @@ def run_enrichment_pipeline(
 
     Architecture:
         Phase 1 (Parallel): HTTPx + Naabu + TLSx run concurrently
-        Phase 2 (Sequential): Katana runs after HTTPx completes
+        Phase 2: run_katana crawls live web services and populates Endpoints
+        Phase 3: run_nuclei_scan (also crawls with Katana internally, then scans)
     """
     from app.database import SessionLocal
     db = SessionLocal()
@@ -94,7 +95,7 @@ def run_enrichment_pipeline(
             run_tlsx.si(tenant_id, candidates)
         ]
 
-        # Phase 2: Run Katana after all enrichment completes
+        # Phase 2: Run Katana endpoint discovery after enrichment completes
         # Phase 3: Run Nuclei after Katana (if enabled)
         # chord(group_of_tasks, callback) - callback runs after ALL group tasks complete
         from celery import chord
@@ -102,7 +103,7 @@ def run_enrichment_pipeline(
         if settings.feature_nuclei_enabled:
             from app.tasks.scanning import run_nuclei_scan
 
-            # Use chord to wait for ALL enrichment tasks, then run Katana, then Nuclei
+            # Wait for all enrichment tasks, then run Katana, then Nuclei
             # chord() returns an AsyncResult when called, don't call apply_async() again
             result = chord(parallel_tasks)(
                 chain(
@@ -111,7 +112,7 @@ def run_enrichment_pipeline(
                 )
             )
         else:
-            # Use chord to wait for ALL enrichment tasks, then run Katana
+            # Wait for all enrichment tasks, then run Katana endpoint discovery
             result = chord(parallel_tasks)(
                 run_katana.si(tenant_id, candidates)
             )
@@ -1019,24 +1020,31 @@ def parse_tlsx_result(result: Dict, tenant_logger) -> Optional[Dict]:
 @celery.task(name='app.tasks.enrichment.run_katana')
 def run_katana(tenant_id: int, asset_ids: List[int]):
     """
-    Run Katana for web crawling and endpoint discovery
+    Run Katana for web crawling and endpoint discovery.
 
-    IMPORTANT: Respects robots.txt by default. Set katana_respect_robots=False
-    in config to disable (not recommended).
+    For each asset with live HTTP services (discovered by HTTPx), runs the
+    katana crawler through SecureToolExecutor, parses the JSONL output, and
+    persists discovered endpoints via EndpointRepository. Populates the
+    Endpoint inventory used by the /endpoints API.
 
-    Discovers:
-    - API endpoints
+    Discovers and classifies:
+    - API endpoints (is_api)
     - Web pages and paths
     - Forms (potential XSS/CSRF targets)
-    - External links
-    - File downloads
+    - External links (is_external)
+    - Static files
+
+    Respects the crawl depth / rate limits configured in settings
+    (katana_max_depth, katana_timeout, katana_rate_limit if set).
 
     Args:
         tenant_id: Tenant ID
         asset_ids: List of asset IDs to crawl (must have live HTTP services)
 
     Returns:
-        Dict with crawl results
+        Dict with crawl results:
+        {'endpoints_created', 'endpoints_updated', 'assets_crawled',
+         'total_endpoints', 'status'}
     """
     from app.database import SessionLocal
     from app.repositories.service_repository import ServiceRepository
@@ -1046,17 +1054,117 @@ def run_katana(tenant_id: int, asset_ids: List[int]):
     tenant_logger = TenantLoggerAdapter(logger, {'tenant_id': tenant_id})
 
     try:
-        # Get assets with live HTTP services
-        # Katana depends on HTTPx results
-        service_repo = ServiceRepository(db)
+        assets = db.query(Asset).filter(
+            Asset.id.in_(asset_ids),
+            Asset.tenant_id == tenant_id
+        ).all()
 
-        # TODO: Implement getting live web services
-        # For now, placeholder
-        tenant_logger.info(f"Katana crawling not yet fully implemented (tenant {tenant_id})")
+        if not assets:
+            tenant_logger.warning(f"No assets found for Katana (IDs: {asset_ids})")
+            return {'endpoints_created': 0, 'endpoints_updated': 0,
+                    'assets_crawled': 0, 'total_endpoints': 0, 'status': 'no_assets'}
+
+        service_repo = ServiceRepository(db)
+        endpoint_repo = EndpointRepository(db)
+        url_validator = URLValidator()
+
+        total_created = 0
+        total_updated = 0
+        assets_crawled = 0
+        all_raw = []
+
+        for asset in assets:
+            # Build the list of live web URLs to crawl for this asset.
+            # Prefer live services discovered by HTTPx; fall back to the
+            # asset identifier for domain/subdomain assets.
+            seed_urls = []
+            for svc in service_repo.get_web_services(asset.id, only_live=True):
+                scheme = 'https' if (svc.has_tls or svc.port in (443, 8443)) else 'http'
+                host = asset.identifier
+                port_suffix = '' if svc.port in (80, 443) else f":{svc.port}"
+                seed_urls.append(f"{scheme}://{host}{port_suffix}")
+
+            if not seed_urls and asset.type in (AssetType.DOMAIN, AssetType.SUBDOMAIN):
+                seed_urls.append(f"https://{asset.identifier}")
+
+            # Validate + dedupe seeds (SSRF-safe)
+            seeds = []
+            for u in dict.fromkeys(seed_urls):
+                is_valid, _ = url_validator.validate_url(u)
+                if is_valid:
+                    seeds.append(u)
+
+            if not seeds:
+                continue
+
+            base_host = (asset.identifier or '').lower()
+            endpoints_data = []
+
+            with SecureToolExecutor(tenant_id) as executor:
+                for seed in seeds:
+                    try:
+                        returncode, stdout, stderr = executor.execute(
+                            'katana',
+                            [
+                                '-u', seed,
+                                '-jsonl',                                  # structured output
+                                '-silent',
+                                '-no-color',
+                                '-jc',                                     # crawl JS files
+                                '-d', str(settings.katana_max_depth),      # crawl depth
+                                '-timeout', '10',                          # per-request timeout
+                                '-rate-limit', str(getattr(settings, 'katana_rate_limit', 150)),
+                            ],
+                            timeout=settings.katana_timeout
+                        )
+                    except ToolExecutionError as e:
+                        tenant_logger.warning(f"Katana failed for {seed}: {e}")
+                        continue
+
+                    if returncode != 0:
+                        tenant_logger.warning(
+                            f"Katana non-zero exit ({returncode}) for {seed}: {stderr[:200]}"
+                        )
+
+                    for line in stdout.strip().split('\n'):
+                        if not line.strip():
+                            continue
+                        parsed = parse_katana_line(line, seed, base_host)
+                        if parsed:
+                            endpoints_data.append(parsed)
+
+            if not endpoints_data:
+                assets_crawled += 1
+                continue
+
+            # Deduplicate by (url, method) to satisfy the unique constraint
+            deduped = {}
+            for ep in endpoints_data:
+                deduped[(ep['url'], ep.get('method', 'GET'))] = ep
+
+            result = endpoint_repo.bulk_upsert(asset.id, list(deduped.values()))
+            total_created += result['created']
+            total_updated += result['updated']
+            assets_crawled += 1
+            all_raw.append({'asset_id': asset.id, 'endpoints': len(deduped)})
+
+            tenant_logger.info(
+                f"Katana crawled asset {asset.id} ({asset.identifier}): "
+                f"{result['created']} new, {result['updated']} updated endpoints"
+            )
+
+        # Store a summary of the raw crawl in MinIO
+        try:
+            store_raw_output(tenant_id, 'katana', {'assets': all_raw})
+        except Exception as e:
+            tenant_logger.warning(f"Failed to store Katana raw output: {e}")
 
         return {
-            'endpoints_discovered': 0,
-            'status': 'not_implemented'
+            'endpoints_created': total_created,
+            'endpoints_updated': total_updated,
+            'assets_crawled': assets_crawled,
+            'total_endpoints': total_created + total_updated,
+            'status': 'success'
         }
 
     except Exception as e:
@@ -1064,3 +1172,140 @@ def run_katana(tenant_id: int, asset_ids: List[int]):
         return {'error': str(e), 'endpoints_discovered': 0}
     finally:
         db.close()
+
+
+# File extensions treated as static files / downloads
+_STATIC_EXTENSIONS = (
+    '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff',
+    '.woff2', '.ttf', '.eot', '.map', '.pdf', '.zip', '.gz', '.tar', '.mp4',
+    '.webp', '.xml', '.txt'
+)
+
+# Path fragments / tags that indicate an API endpoint
+_API_HINTS = ('/api/', '/v1/', '/v2/', '/v3/', '/graphql', '/rest/', '/gql', '.json')
+
+
+def parse_katana_line(line: str, source_url: str, base_host: str) -> Optional[Dict]:
+    """
+    Parse a single line of Katana output into an endpoint dict.
+
+    Handles Katana's ``-jsonl`` structured output; falls back to treating the
+    line as a bare URL if it is not valid JSON. Returns a dict shaped for
+    ``EndpointRepository.bulk_upsert`` or None if the line yields no usable URL.
+
+    Args:
+        line: One line of katana stdout
+        source_url: The seed URL this crawl started from
+        base_host: Lowercased host of the asset (used for internal/external check)
+
+    Returns:
+        Endpoint dict or None
+    """
+    method = 'GET'
+    status_code = None
+    content_type = None
+    content_length = None
+    tag = None
+    raw = None
+    url = None
+
+    line = line.strip()
+    if not line:
+        return None
+
+    if line.startswith('{'):
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        request = raw.get('request', raw)
+        response = raw.get('response', {}) or {}
+
+        url = request.get('endpoint') or request.get('url') or raw.get('endpoint')
+        method = (request.get('method') or 'GET').upper()
+        tag = request.get('tag') or request.get('source')
+
+        status_code = response.get('status_code')
+        content_length = response.get('content_length')
+        content_type = response.get('content_type')
+        if not content_type:
+            headers = response.get('headers') or {}
+            # katana lowercases/normalises header keys differently across versions
+            content_type = headers.get('content_type') or headers.get('Content-Type')
+    else:
+        # Plain-text output: the line is the URL itself
+        url = line
+
+    if not url or not isinstance(url, str):
+        return None
+    if not url.startswith(('http://', 'https://')):
+        return None
+
+    parsed = urlparse(url)
+    path = parsed.path or '/'
+    query_params = None
+    if parsed.query:
+        # parse_qs returns lists; flatten single-value params for readability
+        query_params = {
+            k: (v[0] if len(v) == 1 else v)
+            for k, v in parse_qs(parsed.query).items()
+        }
+
+    host = (parsed.hostname or '').lower()
+    is_external = bool(host) and base_host and host != base_host and not host.endswith('.' + base_host)
+
+    # Normalise content-type (strip charset etc.)
+    if content_type:
+        content_type = content_type.split(';')[0].strip()[:200]
+
+    endpoint_type, is_api = _classify_endpoint(
+        path=path,
+        query_params=query_params,
+        tag=tag,
+        status_code=status_code,
+        content_type=content_type,
+        is_external=is_external,
+    )
+
+    return {
+        'url': url[:2048],
+        'method': method[:10],
+        'path': path[:1024],
+        'query_params': query_params,
+        'status_code': status_code,
+        'content_type': content_type,
+        'content_length': content_length,
+        'endpoint_type': endpoint_type,
+        'is_external': is_external,
+        'is_api': is_api,
+        'source_url': source_url[:2048],
+        'raw_data': raw,
+    }
+
+
+def _classify_endpoint(path, query_params, tag, status_code, content_type, is_external):
+    """Return (endpoint_type, is_api) from the parsed signals."""
+    lower_path = (path or '').lower()
+
+    if tag and str(tag).lower() == 'form':
+        return 'form', False
+
+    if is_external:
+        return 'external', False
+
+    looks_api = (
+        any(hint in lower_path for hint in _API_HINTS)
+        or (content_type is not None and 'json' in content_type)
+        or bool(query_params)
+    )
+    if looks_api:
+        return 'api', True
+
+    if lower_path.endswith(_STATIC_EXTENSIONS):
+        return 'file', False
+
+    if status_code is not None and 300 <= status_code < 400:
+        return 'redirect', False
+
+    return 'static', False

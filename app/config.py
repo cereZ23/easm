@@ -186,6 +186,15 @@ class Settings(BaseSettings):
     feature_nuclei_enabled: bool = True
     feature_notifications_enabled: bool = False
 
+    # Alerting / Notifications
+    # Delivery channels (leave unset to disable that channel). At least one
+    # channel must be configured for alerts to actually be sent.
+    alert_webhook_url: Optional[str] = None        # generic JSON webhook (POST)
+    alert_slack_webhook_url: Optional[str] = None  # Slack incoming webhook
+    alert_min_severity: str = "high"               # critical | high | medium | low | info
+    alert_lookback_hours: int = 1                  # window scanned each alert run
+    alert_delivery_timeout: int = 10               # seconds per HTTP delivery
+
     @model_validator(mode='after')
     def validate_production_secrets(self):
         """

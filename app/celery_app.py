@@ -22,7 +22,7 @@ celery = Celery(
         'app.tasks.discovery',
         'app.tasks.enrichment',
         'app.tasks.scanning',
-        # 'app.tasks.alerting'  # Not yet implemented
+        'app.tasks.alerting',
     ]
 )
 
@@ -56,6 +56,15 @@ celery.conf.beat_schedule = {
         'task': 'app.tasks.discovery.watch_critical_assets',
         'schedule': crontab(minute='*/30'),  # Every 30 minutes
         'options': {'expires': 1800}  # Task expires after 30 minutes
+    },
+    # Alerting: fan out per-tenant alert tasks hourly. The look-back window
+    # (settings.alert_lookback_hours, default 1h) is aligned with this cadence
+    # so each finding/asset is alerted about once. No-op when notifications
+    # are disabled.
+    'hourly-alert-dispatch': {
+        'task': 'app.tasks.alerting.dispatch_alerts',
+        'schedule': crontab(minute=0),  # Top of every hour
+        'options': {'expires': 3000}
     },
 }
 

@@ -4,12 +4,14 @@ FastAPI Dependencies
 Common dependencies for authentication, database sessions, pagination, and multi-tenant isolation.
 """
 
+import time
 from typing import Optional, Dict, Any, Generator
-from fastapi import Depends, HTTPException, Query, status
+from fastapi import Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 import logging
 
+from app.config import settings
 from app.database import SessionLocal
 from app.security.jwt_auth import jwt_manager
 from app.models.auth import User, TenantMembership
@@ -273,12 +275,62 @@ async def require_admin(
     return current_user
 
 
-# Rate limiting (placeholder for future implementation)
-async def rate_limit_dependency():
+# Rate limiting dependency (Redis-backed, per authenticated user or client IP).
+#
+# The RateLimitMiddleware provides a global + per-IP baseline for every request;
+# add this dependency to specific routers/endpoints that need a tighter,
+# identity-aware limit (e.g. expensive scan-trigger endpoints).
+async def rate_limit_dependency(request: Request):
     """
-    Rate limiting dependency
+    Enforce a per-user (or per-IP) rate limit using the shared Redis limiter.
 
-    TODO: Implement actual rate limiting with Redis
-    For now, this is a placeholder
+    Identity resolution:
+      - Authenticated requests are limited by the JWT subject (user id)
+      - Unauthenticated requests fall back to the client IP
+
+    Limit comes from settings.rate_limit_requests_per_minute. No-op when
+    settings.rate_limit_enabled is False. Fails open if Redis is unavailable
+    (the limiter returns "allowed" on RedisError).
+
+    Raises:
+        HTTPException 429 if the caller exceeds the limit.
     """
-    pass
+    if not settings.rate_limit_enabled:
+        return
+
+    from app.core.rate_limiter import get_rate_limiter
+
+    # Resolve identity: JWT subject if present, else client IP
+    identifier = request.client.host if request.client else "unknown"
+    scope = "ip"
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=auth_header[7:])
+            payload = jwt_manager.verify_token(creds)
+            identifier = str(payload.get("sub") or payload.get("user_id") or identifier)
+            scope = "user"
+        except Exception:
+            # Invalid token here just means we rate-limit by IP; auth is
+            # enforced separately by the endpoint's auth dependency.
+            pass
+
+    limiter = get_rate_limiter()
+    is_allowed, remaining, reset_time = limiter.check_rate_limit(
+        identifier=identifier,
+        limit=settings.rate_limit_requests_per_minute,
+        window=60,
+        scope=scope,
+    )
+
+    if not is_allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please slow down and retry shortly.",
+            headers={
+                "X-RateLimit-Limit": str(settings.rate_limit_requests_per_minute),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(reset_time),
+                "Retry-After": str(max(1, reset_time - int(time.time()))),
+            },
+        )

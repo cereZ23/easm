@@ -78,8 +78,8 @@ Data flows through three Celery task stages, each writing assets/findings to Pos
 ```
 Seeds (domains/ASNs/keywords)
   → discovery   (app/tasks/discovery.py):  uncover → subfinder + amass (parallel) → merge/dedup → dnsx
-  → enrichment  (app/tasks/enrichment.py): httpx (tech fingerprint) → naabu (ports) → tlsx (certs) → katana (crawl)
-  → scanning    (app/tasks/scanning.py):   nuclei (CVE detection) → risk scoring
+  → enrichment  (app/tasks/enrichment.py): httpx (tech fingerprint) → naabu (ports) → tlsx (certs) → katana (crawl → populates Endpoints)
+  → scanning    (app/tasks/scanning.py):   katana crawl (feeds URLs) → nuclei (CVE detection) → risk scoring
 ```
 
 Enrichment auto-triggers after discovery (`enrichment_auto_trigger`), and is **tiered by asset priority** (`critical`/`high`/`normal`/`low` on `Asset.priority`).
