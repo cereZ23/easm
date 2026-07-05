@@ -322,6 +322,7 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
                     '-title',                   # Include page title
                     '-web-server',              # Detect web server
                     '-tech-detect',             # Detect technologies (safe in v1.6.8)
+                    '-irh',                     # Include response headers (for header/cookie tech hints)
                     '-response-time',           # Include response time
                     '-content-length',          # Include content length
                     '-follow-redirects',        # Follow redirects
@@ -427,6 +428,60 @@ def run_httpx(tenant_id: int, asset_ids: List[int]):
         db.close()
 
 
+def _tech_from_headers(headers: Dict) -> List[str]:
+    """Infer additional technologies from HTTP response headers and cookies.
+
+    httpx's -tech-detect (Wappalyzer-style) often only sees the CDN edge. Response
+    headers frequently leak the real origin server (Via), backend runtime
+    (X-Powered-By), CMS (X-Generator/X-Drupal-*), and framework (session cookie
+    names). This fills that gap.
+    """
+    tech: List[str] = []
+    if not isinstance(headers, dict):
+        return tech
+
+    # Normalise header keys (httpx uses lowercase + underscores already)
+    h = {str(k).lower().replace('-', '_'): v for k, v in headers.items()}
+
+    def add(name):
+        name = (name or '').strip()
+        if name and name not in tech:
+            tech.append(name)
+
+    # Via header reveals proxy/origin server chain (e.g. "1.1 Caddy")
+    via = str(h.get('via', '') or '')
+    for proxy in ('Caddy', 'Varnish', 'nginx', 'Apache', 'HAProxy', 'Envoy', 'squid', 'Traefik'):
+        if proxy.lower() in via.lower():
+            add(proxy)
+
+    # Backend runtime / framework from X-Powered-By (e.g. "PHP/8.1", "Express")
+    xpb = str(h.get('x_powered_by', '') or '')
+    if xpb:
+        add(xpb.split('/')[0])
+    if h.get('x_aspnet_version') or h.get('x_aspnetmvc_version'):
+        add('ASP.NET')
+    if h.get('x_drupal_cache') or h.get('x_drupal_dynamic_cache'):
+        add('Drupal')
+    if h.get('x_generator'):
+        add(str(h['x_generator']).split(' ')[0])
+    if h.get('x_shopify_stage'):
+        add('Shopify')
+
+    # Framework hints from session cookie names
+    cookies = str(h.get('set_cookie', '') or '').lower()
+    cookie_map = {
+        'phpsessid': 'PHP', 'laravel_session': 'Laravel', 'ci_session': 'CodeIgniter',
+        'jsessionid': 'Java', 'csrftoken': 'Django', 'django': 'Django',
+        'connect.sid': 'Express', '_rails': 'Ruby on Rails', 'wordpress_': 'WordPress',
+        'wp-': 'WordPress', 'asp.net_sessionid': 'ASP.NET',
+    }
+    for marker, name in cookie_map.items():
+        if marker in cookies:
+            add(name)
+
+    return tech
+
+
 def parse_httpx_result(result: Dict, tenant_logger) -> Optional[Dict]:
     """
     Parse HTTPx JSON output into service data
@@ -457,17 +512,25 @@ def parse_httpx_result(result: Dict, tenant_logger) -> Optional[Dict]:
         if not port:
             port = 443 if parsed.scheme == 'https' else 80
 
-        # Sanitize headers - redact sensitive values
-        headers = result.get('header', {})
-        if isinstance(headers, dict):
-            sanitized_headers = sanitize_http_headers(headers)
+        # Raw headers are used for tech fingerprinting BEFORE redaction (cookie
+        # names like PHPSESSID reveal the stack); sanitized copy is stored.
+        raw_headers = result.get('header', {})
+        if isinstance(raw_headers, dict):
+            sanitized_headers = sanitize_http_headers(raw_headers)
         else:
+            raw_headers = {}
             sanitized_headers = {}
 
-        # Extract technologies (list of strings)
-        technologies = result.get('technologies', [])
+        # Extract technologies (list of strings). httpx emits this under the
+        # 'tech' key; older builds/schemas used 'technologies' — accept both.
+        technologies = result.get('tech') or result.get('technologies') or []
         if not isinstance(technologies, list):
-            technologies = []
+            technologies = list(technologies) if technologies else []
+
+        # Enrich with tech inferred from response headers/cookies — this surfaces
+        # the origin/backend stack that -tech-detect misses behind a CDN
+        # (e.g. Caddy via the Via header, PHP/Express via X-Powered-By/cookies).
+        technologies = list(dict.fromkeys(technologies + _tech_from_headers(raw_headers)))
 
         # Build service data
         service_data = {
@@ -633,8 +696,9 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
             tenant_logger.warning(f"No assets found for Naabu (IDs: {asset_ids})")
             return {'ports_discovered': 0}
 
-        # Build host list
+        # Build host list + host -> asset_id map for attributing discovered ports
         hosts = []
+        host_to_asset_id = {}
         domain_validator = DomainValidator()
 
         for asset in assets:
@@ -642,10 +706,12 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
                 is_valid, _ = domain_validator.validate_domain(asset.identifier)
                 if is_valid:
                     hosts.append(asset.identifier)
+                    host_to_asset_id[asset.identifier.lower()] = asset.id
             elif asset.type == AssetType.IP:
                 # Validate IP is not in blocklist
                 if is_ip_allowed(asset.identifier, tenant_logger):
                     hosts.append(asset.identifier)
+                    host_to_asset_id[asset.identifier.lower()] = asset.id
 
         if not hosts:
             tenant_logger.warning(f"No valid hosts for Naabu (tenant {tenant_id})")
@@ -669,7 +735,12 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
             if full_scan:
                 args.extend(['-p', '-'])  # All ports
             else:
-                args.extend(['-top-ports', settings.naabu_default_ports or '1000'])
+                # naabu's -top-ports expects a number (100/1000) or 'full',
+                # NOT a "top-1000" string. Normalise the configured value.
+                top_ports = (settings.naabu_default_ports or '1000').strip()
+                if top_ports.startswith('top-'):
+                    top_ports = top_ports[len('top-'):]
+                args.extend(['-top-ports', top_ports])
 
             # Exclude blocked ports
             if settings.naabu_blocked_ports:
@@ -708,19 +779,43 @@ def run_naabu(tenant_id: int, asset_ids: List[int], full_scan: bool = False):
             except Exception as e:
                 tenant_logger.warning(f"Failed to store Naabu raw output: {e}")
 
-            # Upsert services to database
-            # (Similar to HTTPx, group by asset and bulk upsert)
+            # Attribute each discovered port to its asset and persist as a service.
             service_repo = ServiceRepository(db)
+
+            services_by_asset = {}
+            for svc in services_data:
+                host = (svc.get('host') or '').lower()
+                port = svc.get('port')
+                asset_id = host_to_asset_id.get(host)
+                if not asset_id or not port:
+                    continue
+                # dedupe by port within an asset (unique constraint asset_id+port)
+                services_by_asset.setdefault(asset_id, {})[port] = {
+                    'port': port,
+                    'protocol': svc.get('protocol', 'tcp'),
+                    'enrichment_source': 'naabu',
+                }
+
             total_created = 0
             total_updated = 0
+            for asset_id, port_map in services_by_asset.items():
+                res = service_repo.bulk_upsert(asset_id, list(port_map.values()))
+                total_created += res['created']
+                total_updated += res['updated']
 
-            # TODO: Map hosts back to asset IDs
-            # For now, log the results
-            tenant_logger.info(f"Naabu discovered {len(services_data)} open ports")
+            db.commit()
+
+            tenant_logger.info(
+                f"Naabu: {len(services_data)} open ports -> {total_created} new, "
+                f"{total_updated} updated services (tenant {tenant_id})"
+            )
 
             return {
                 'ports_discovered': len(services_data),
-                'hosts_scanned': len(hosts)
+                'services_created': total_created,
+                'services_updated': total_updated,
+                'hosts_scanned': len(hosts),
+                'status': 'success'
             }
 
     except ToolExecutionError as e:
@@ -826,8 +921,10 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
     """
     from app.database import SessionLocal
     from app.repositories.certificate_repository import CertificateRepository
+    from app.repositories.service_repository import ServiceRepository
 
     db = SessionLocal()
+    service_repo = ServiceRepository(db)
     tenant_logger = TenantLoggerAdapter(logger, {'tenant_id': tenant_id})
 
     try:
@@ -841,8 +938,10 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
             tenant_logger.warning(f"No assets found for TLSx (IDs: {asset_ids})")
             return {'certificates_discovered': 0}
 
-        # Build host list (only domains/IPs with potential HTTPS)
+        # Build host list (only domains/IPs with potential HTTPS) and a
+        # host -> asset_id map so parsed certificates can be attributed.
         hosts = []
+        host_to_asset_id = {}
         domain_validator = DomainValidator()
 
         for asset in assets:
@@ -850,9 +949,11 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
                 is_valid, _ = domain_validator.validate_domain(asset.identifier)
                 if is_valid:
                     hosts.append(asset.identifier)
+                    host_to_asset_id[asset.identifier.lower()] = asset.id
             elif asset.type == AssetType.IP:
                 if is_ip_allowed(asset.identifier, tenant_logger):
                     hosts.append(asset.identifier)
+                    host_to_asset_id[asset.identifier.lower()] = asset.id
 
         if not hosts:
             tenant_logger.warning(f"No valid hosts for TLSx (tenant {tenant_id})")
@@ -866,16 +967,17 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
             hosts_content = '\n'.join(hosts)
 
             # Execute TLSx with stdin
+            # NOTE: tlsx's default -json output already includes SANs, CN,
+            # cipher, TLS version, issuer, validity dates, etc. The -san/-cn
+            # flags are exclusive "probe" modes that error when combined with
+            # other options ("san or cn flag cannot be used with other probes"),
+            # so we rely on the rich default JSON plus -hash for a fingerprint.
             returncode, stdout, stderr = executor.execute(
                 'tlsx',
                 [
                     '-json',
                     '-silent',
-                    '-san',               # Include SANs
-                    '-cn',                # Include CN
-                    '-cipher',            # Include cipher suites
-                    '-tls-version',       # Include TLS version
-                    '-hash', 'sha256'     # Certificate hash
+                    '-hash', 'sha256',    # Certificate SHA-256 fingerprint
                 ],
                 timeout=settings.tlsx_timeout,
                 stdin_data=hosts_content
@@ -927,14 +1029,45 @@ def run_tlsx(tenant_id: int, asset_ids: List[int]):
             except Exception as e:
                 tenant_logger.warning(f"Failed to store TLSx raw output: {e}")
 
-            # Upsert certificates to database
-            # (Similar pattern to HTTPx/Naabu)
-            tenant_logger.info(f"TLSx discovered {len(certificates_data)} certificates")
+            # Attribute each certificate to its asset and persist it.
+            from app.repositories.certificate_repository import CertificateRepository
+            cert_repo = CertificateRepository(db)
+
+            certs_by_asset = {}
+            for cert in certificates_data:
+                host = (cert.get('host') or '').lower()
+                asset_id = host_to_asset_id.get(host)
+                if not asset_id:
+                    continue
+                # dedupe by serial within an asset (unique constraint)
+                certs_by_asset.setdefault(asset_id, {})[cert['serial_number']] = cert
+
+            total_created = 0
+            total_updated = 0
+            for asset_id, serial_map in certs_by_asset.items():
+                res = cert_repo.bulk_upsert(asset_id, list(serial_map.values()))
+                total_created += res['created']
+                total_updated += res['updated']
+
+                # Mark the asset's HTTPS services as TLS-enabled
+                for svc in service_repo.get_web_services(asset_id, only_live=False):
+                    if svc.port in (443, 8443) or svc.protocol == 'https':
+                        svc.has_tls = True
+
+            db.commit()
+
+            tenant_logger.info(
+                f"TLSx: {total_created} new, {total_updated} updated certificates "
+                f"across {len(certs_by_asset)} assets (tenant {tenant_id})"
+            )
 
             return {
+                'certificates_created': total_created,
+                'certificates_updated': total_updated,
                 'certificates_discovered': len(certificates_data),
                 'hosts_analyzed': len(hosts),
-                'private_key_detected': private_key_detected
+                'private_key_detected': private_key_detected,
+                'status': 'success'
             }
 
     except ToolExecutionError as e:
@@ -996,17 +1129,81 @@ def detect_and_redact_private_keys(text: str, tenant_logger) -> Tuple[bool, str]
     return detected, sanitized
 
 
-def parse_tlsx_result(result: Dict, tenant_logger) -> Optional[Dict]:
-    """Parse TLSx JSON output into certificate data"""
+def _parse_tls_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Parse a tlsx ISO-8601 timestamp (e.g. '2026-09-20T13:33:56Z') to naive UTC."""
+    if not value:
+        return None
     try:
-        # TODO: Full implementation
-        # Extract certificate fields from TLSx JSON
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).replace(tzinfo=None)
+    except (ValueError, AttributeError):
+        return None
+
+
+def parse_tlsx_result(result: Dict, tenant_logger) -> Optional[Dict]:
+    """Parse a TLSx JSON record into certificate data for CertificateRepository.
+
+    Extracts the full certificate detail tlsx provides by default: subject CN,
+    SANs, issuer, serial, validity window, cipher/TLS version, fingerprint, and
+    derives is_expired / days_until_expiry / is_wildcard / is_self_signed.
+    """
+    try:
+        serial = result.get('serial')
+        if not serial:
+            return None  # serial_number is the unique key; skip records without it
+
+        subject_cn = result.get('subject_cn') or result.get('subject_dn')
+        san_domains = result.get('subject_an') or []
+        issuer = result.get('issuer_cn') or result.get('issuer_dn')
+        if not issuer:
+            issuer_org = result.get('issuer_org')
+            issuer = issuer_org[0] if isinstance(issuer_org, list) and issuer_org else None
+
+        not_before = _parse_tls_datetime(result.get('not_before'))
+        not_after = _parse_tls_datetime(result.get('not_after'))
+
+        is_expired = False
+        days_until_expiry = None
+        if not_after:
+            delta = not_after - datetime.utcnow()
+            days_until_expiry = delta.days
+            is_expired = delta.total_seconds() < 0
+
+        # Wildcard if any SAN or the CN starts with '*.'
+        names = list(san_domains) + ([subject_cn] if subject_cn else [])
+        is_wildcard = any(isinstance(n, str) and n.startswith('*.') for n in names)
+
+        # Self-signed heuristic: subject == issuer
+        is_self_signed = bool(
+            result.get('self_signed')
+            or (subject_cn and issuer and subject_cn == issuer)
+        )
+
+        cipher = result.get('cipher')
+        fingerprint = result.get('fingerprint_hash') or {}
+        sha256_fp = fingerprint.get('sha256') if isinstance(fingerprint, dict) else None
+
         return {
             'host': result.get('host'),
-            'subject_cn': result.get('subject_cn'),
-            'issuer': result.get('issuer'),
-            'serial_number': result.get('serial'),
-            # ... more fields
+            'serial_number': serial,
+            'subject_cn': subject_cn,
+            'issuer': issuer,
+            'not_before': not_before,
+            'not_after': not_after,
+            'is_expired': is_expired,
+            'days_until_expiry': days_until_expiry,
+            'san_domains': san_domains or None,
+            'signature_algorithm': result.get('signature_algorithm'),
+            'public_key_algorithm': result.get('public_key_algorithm'),
+            'cipher_suites': [cipher] if cipher else None,
+            'is_self_signed': is_self_signed,
+            'is_wildcard': is_wildcard,
+            'raw_data': {
+                'tls_version': result.get('tls_version'),
+                'cipher': cipher,
+                'sha256_fingerprint': sha256_fp,
+                'issuer_dn': result.get('issuer_dn'),
+                'subject_dn': result.get('subject_dn'),
+            },
         }
     except Exception as e:
         tenant_logger.warning(f"Failed to parse TLSx result: {e}")
