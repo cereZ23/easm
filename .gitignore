@@ -55,3 +55,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# generated client report artifacts
+itsright_report.pdf
+*_report.pdf

@@ -78,7 +78,8 @@ class NucleiService:
         severity: Optional[List[str]] = None,
         rate_limit: int = 1000,  # Increased from 300 for faster scanning
         concurrency: int = 200,  # Increased from 50 for faster scanning
-        timeout: int = 1800
+        timeout: int = 1800,
+        dast: bool = False  # Enable active fuzzing/DAST (SQLi, XSS, SSTI, cmd-injection)
     ) -> Dict:
         """
         Execute Nuclei scan on list of URLs
@@ -139,7 +140,8 @@ class NucleiService:
                 templates=templates,
                 severity=severity,
                 rate_limit=rate_limit,
-                concurrency=concurrency
+                concurrency=concurrency,
+                dast=dast
             )
 
             # Execute Nuclei
@@ -265,7 +267,8 @@ class NucleiService:
         templates: Optional[List[str]],
         severity: List[str],
         rate_limit: int,
-        concurrency: int
+        concurrency: int,
+        dast: bool = False
     ) -> List[str]:
         """
         Build Nuclei command arguments
@@ -297,6 +300,13 @@ class NucleiService:
             severity_str = ','.join(severity)
             args.extend(['-severity', severity_str])
 
+        # DAST / active fuzzing. CRITICAL: nuclei's fuzzing templates DO NOT run
+        # unless -dast is passed — including '-t http/fuzzing/' without -dast is a
+        # silent no-op (they load but never execute). With -dast, nuclei fuzzes
+        # each parameter/path with injection payloads (SQLi, XSS, SSTI, cmd-inj).
+        if dast:
+            args.append('-dast')
+
         # Add templates
         if templates:
             for template in templates:
@@ -310,12 +320,18 @@ class NucleiService:
             # Use the http/ prefixed paths.
             args.extend([
                 '-t', 'http/cves/',                    # CVE vulnerabilities
-                '-t', 'http/vulnerabilities/',         # Generic vulnerabilities (SQLi, etc.)
+                '-t', 'http/vulnerabilities/',         # Generic vulnerabilities
                 '-t', 'http/exposures/',               # Information disclosure
                 '-t', 'http/misconfiguration/',        # Misconfigurations
                 '-t', 'http/exposed-panels/',          # Admin panels
-                '-t', 'http/fuzzing/',                 # Fuzzing templates (SQL, XSS, etc.)
             ])
+            if dast:
+                # The dedicated DAST corpus (249 templates: SQLi/XSS/SSTI/cmd-inj/
+                # path-traversal) — only meaningful with -dast + parameterised URLs.
+                args.extend([
+                    '-t', 'dast/',
+                    '-t', 'http/fuzzing/',
+                ])
 
         # Exclude certain templates that may cause DoS or are too noisy
         # Only exclude actual DoS templates, allow fuzzing/intrusive tests

@@ -40,22 +40,25 @@ SCAN_LEVELS = {
         'endpoint_filter': None,
         'live_crawl': False,
         'max_targets': 50,
+        'dast': False,                # no active fuzzing at quick level
     },
     'standard': {
         'severities': ['critical', 'high', 'medium'],
-        'templates': None,            # NucleiService default (the 6 http/ categories)
+        'templates': None,            # NucleiService default (high-value http/ categories)
         'include_endpoints': True,
         'endpoint_filter': 'app',     # API/form/pages, skip static files & external
         'live_crawl': True,
         'max_targets': 300,
+        'dast': False,                # fuzzing is intrusive — reserved for deep
     },
     'deep': {
         'severities': ['critical', 'high', 'medium', 'low', 'info'],
-        'templates': ['http/'],       # all HTTP templates incl. fuzzing/injection
+        'templates': None,            # default categories + DAST corpus (added via dast)
         'include_endpoints': True,
         'endpoint_filter': 'all',     # everything on our domains (still skip external)
         'live_crawl': True,
         'max_targets': 1000,
+        'dast': True,                 # ACTIVE fuzzing: SQLi/XSS/SSTI/cmd-inj (authorized only)
     },
 }
 
@@ -300,13 +303,15 @@ def run_nuclei_scan(
         # Step 2: Execute Nuclei scan
         nuclei_service = NucleiService(tenant_id)
 
-        # Use asyncio to run async method
+        # Use asyncio to run async method. dast=True (deep level) enables active
+        # fuzzing/injection testing against the parameterised endpoints.
         scan_result = asyncio.run(
             nuclei_service.scan_urls(
                 urls=scan_targets,  # Scan both base URLs and crawled endpoints
                 templates=templates,
                 severity=severity or ['critical', 'high', 'medium'],
-                rate_limit=rate_limit
+                rate_limit=rate_limit,
+                dast=level_cfg.get('dast', False)
             )
         )
 
@@ -386,6 +391,106 @@ def run_nuclei_scan(
             'tenant_id': tenant_id,
             'error': str(e),
             'status': 'failed'
+        }
+    finally:
+        db.close()
+
+
+@celery.task(name='app.tasks.scanning.run_full_scan')
+def run_full_scan(
+    tenant_id: int,
+    asset_ids: Optional[List[int]] = None,
+    scan_level: str = 'standard',
+    max_retries: int = 1
+):
+    """Run the full enrichment + vuln scan behind a QUALITY GATE.
+
+    This is the entry point that should be used for a real scan. It runs each
+    tool, checks the persisted results against sanity invariants (see
+    app.services.scanning.quality_gate), automatically RE-RUNS flaky tools that
+    returned an impossible zero (e.g. tlsx returning 0 certs for live HTTPS
+    hosts), then runs nuclei. It returns a combined result with a quality
+    verdict so nobody discovers at report time that a stage silently failed.
+
+    Args:
+        tenant_id: Tenant ID
+        asset_ids: Assets to scan (defaults to all active tenant assets)
+        scan_level: 'quick' | 'standard' | 'deep' (deep enables DAST/fuzzing)
+        max_retries: how many times to retry failed retryable tools (default 1)
+
+    Returns:
+        {tenant_id, scan_level, tools:{...}, quality:{overall,checks,...}, status}
+        status is 'degraded' if the quality gate still fails after retries.
+    """
+    from app.database import SessionLocal
+    from app.tasks.enrichment import run_httpx, run_naabu, run_tlsx, run_katana
+    from app.services.scanning.quality_gate import evaluate_scan_quality, RETRYABLE_ON_FAIL
+
+    tenant_logger = TenantLoggerAdapter(logger, {'tenant_id': tenant_id})
+    db = SessionLocal()
+    try:
+        if asset_ids is None:
+            asset_ids = [
+                a.id for a in db.query(Asset).filter(
+                    Asset.tenant_id == tenant_id, Asset.is_active == True
+                ).all()
+            ]
+        if not asset_ids:
+            return {'tenant_id': tenant_id, 'status': 'no_assets'}
+
+        tenant_logger.info(f"Full scan start (level={scan_level}, {len(asset_ids)} assets)")
+
+        # --- Enrichment stage ---
+        tool_results = {
+            'httpx': run_httpx(tenant_id, asset_ids),
+            'naabu': run_naabu(tenant_id, asset_ids, False),
+            'tlsx': run_tlsx(tenant_id, asset_ids),
+            'katana': run_katana(tenant_id, asset_ids),
+        }
+
+        # --- Quality gate + auto-retry of flaky tools (before spending time on nuclei) ---
+        db.expire_all()
+        gate = evaluate_scan_quality(db, tenant_id, tool_results)
+        for attempt in range(max_retries):
+            failed = [
+                c['name'] for c in gate['checks']
+                if c['status'] == 'fail' and c['name'] in RETRYABLE_ON_FAIL
+            ]
+            if not failed:
+                break
+            for check_name in failed:
+                tool = RETRYABLE_ON_FAIL[check_name]
+                tenant_logger.warning(
+                    f"[quality-gate] check '{check_name}' failed — retrying {tool} "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                if tool == 'httpx':
+                    tool_results['httpx'] = run_httpx(tenant_id, asset_ids)
+                elif tool == 'naabu':
+                    tool_results['naabu'] = run_naabu(tenant_id, asset_ids, False)
+                elif tool == 'tlsx':
+                    tool_results['tlsx'] = run_tlsx(tenant_id, asset_ids)
+            db.expire_all()
+            gate = evaluate_scan_quality(db, tenant_id, tool_results)
+
+        # --- Vulnerability scan (nuclei; deep level runs DAST/fuzzing) ---
+        tool_results['nuclei'] = run_nuclei_scan(tenant_id, asset_ids, scan_level=scan_level)
+
+        # --- Final verdict over the whole scan ---
+        db.expire_all()
+        final_gate = evaluate_scan_quality(db, tenant_id, tool_results)
+
+        if final_gate['overall'] == 'fail':
+            tenant_logger.error(
+                f"[quality-gate] FINAL VERDICT: DEGRADED — {final_gate['summary']}"
+            )
+
+        return {
+            'tenant_id': tenant_id,
+            'scan_level': scan_level,
+            'tools': tool_results,
+            'quality': final_gate,
+            'status': 'degraded' if final_gate['overall'] == 'fail' else 'success',
         }
     finally:
         db.close()

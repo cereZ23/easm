@@ -53,6 +53,9 @@ cryptography==41.0.7  # Secret encryption (Sprint 2 security fix)
 # Monitoring and Error Tracking
 sentry-sdk[celery,sqlalchemy]==1.40.0
 
+# PDF report generation (pure-Python, no system deps)
+reportlab==4.0.9
+
 # Optional secret backends (install only if SECRET_BACKEND is set accordingly).
 # The env/file backends work without these; they are lazily imported.
 #   SECRET_BACKEND=vault  ->  hvac
